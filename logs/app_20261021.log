@@ -40,3 +40,13 @@
 2026-10-21 15:29:28 INFO    copier: Сводка по строкам: D:\VideoExport\AZS75\report_20261021_152928_summary.csv
 2026-10-21 15:29:28 INFO    gui: Обработка завершена: строк 9, скопировано 392, уже было 16, перезаписано 0, не найдено 14, ошибок 0
 2026-10-21 15:47:14 INFO    gui: Приложение закрыто пользователем.
+2026-10-21 16:39:31 INFO    main: Лог файла: D:\Projects\FuelVideo\logs\app_20261021.log
+2026-10-21 16:39:31 INFO    drives: Обнаружено дисков с VIDEO: 1: [D:\VIDEO]
+2026-10-21 16:39:31 INFO    main: Старт. current_azs=auto; выбрана АЗС: 75; video_roots=D:\VIDEO; output_root=D:\VideoExport\AZS75; интервал: -2/+10 мин
+2026-10-21 16:39:34 INFO    gui: Приложение закрыто пользователем.
+2026-10-21 16:42:35 INFO    main: Лог файла: D:\Projects\FuelVideo\logs\app_20261021.log
+2026-10-21 16:42:35 INFO    drives: Обнаружено дисков с VIDEO: 1: [D:\VIDEO]
+2026-10-21 16:43:06 INFO    main: Лог файла: D:\Projects\FuelVideo\logs\app_20261021.log
+2026-10-21 16:43:06 INFO    drives: Обнаружено дисков с VIDEO: 1: [D:\VIDEO]
+2026-10-21 16:43:06 INFO    main: Старт. current_azs=auto; выбрана АЗС: 75; video_roots=D:\VIDEO; output_root=D:\VideoExport\AZS75; интервал: -2/+10 мин
+2026-10-21 16:43:11 INFO    gui: Приложение закрыто пользователем.

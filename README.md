@@ -1,4 +1,4 @@
-# VideoExporter — копирование видео и звука из СВН «Интеллект» по данным из Excel
+# FuelVideo — копирование видео и звука из СВН «Интеллект» по данным из Excel
 
 ## 1. Назначение
 
@@ -213,13 +213,13 @@ build.bat
 Скрипт создаёт venv, ставит `requirements.txt` и запускает:
 
 ```bat
-pyinstaller --noconfirm --onefile --windowed --name VideoExporter ^
+pyinstaller --noconfirm --onefile --windowed --name FuelVideo ^
     --add-data "settings.ini;." --add-data "azs.ini;." ^
     --hidden-import openpyxl ^
     main.py
 ```
 
-Результат: `dist\VideoExporter.exe`. Рядом с exe при первом запуске будут созданы
+Результат: `dist\FuelVideo.exe`. Рядом с exe при первом запуске будут созданы
 `settings.ini`, `azs.ini` и `logs\` (шаблоны встроены в код).
 
 ## 10. Запуск на Windows 10/11 и на Windows 7

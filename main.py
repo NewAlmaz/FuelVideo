@@ -1,4 +1,4 @@
-"""Точка входа приложения VideoExporter.
+"""Точка входа приложения FuelVideo.
 
 Режимы запуска::
 
@@ -43,7 +43,7 @@ LOGGER = logging.getLogger("main")
 def build_arg_parser() -> argparse.ArgumentParser:
     """Создать парсер аргументов командной строки."""
     parser = argparse.ArgumentParser(
-        prog="VideoExporter",
+        prog="FuelVideo",
         description="Копирование видео и звука из СВН «Интеллект» по данным из Excel.",
     )
     parser.add_argument(
@@ -133,7 +133,7 @@ def run_selftest(config: AppConfig, xlsx_path: Optional[Path]) -> int:
     :param xlsx_path: путь к xlsx (может быть ``None``)
     :return: 0, если хотя бы одна строка обработана без ошибок, иначе 1
     """
-    print("=== VideoExporter: самотестирование ===")
+    print("=== FuelVideo: самотестирование ===")
     print()
 
     parsed_current = parse_current_azs(config.general.current_azs)

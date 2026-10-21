@@ -303,7 +303,7 @@ class ExporterApp(tk.Tk):
         self._event_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
         self._reports: Tuple[Optional[Path], Optional[Path]] = (None, None)
 
-        self.title("VideoExporter — копирование видео и звука из СВН «Интеллект»")
+        self.title("FuelVideo — копирование видео и звука из СВН «Интеллект»")
         self.geometry("1200x720")
         self.minsize(980, 600)
 
@@ -491,7 +491,7 @@ class ExporterApp(tk.Tk):
         drives.reset_cache()
         self._update_azs_label()
         self._rebuild_settings()
-        self.title(f"VideoExporter — АЗС {azs.number}")
+        self.title(f"FuelVideo — АЗС {azs.number}")
         LOGGER.info(
             "Выбрана АЗС: %s; output_root=%s; video_roots=%s",
             azs.number,
@@ -673,7 +673,7 @@ class ExporterApp(tk.Tk):
                 LOGGER.exception("Ошибка обработки: %s", exc)
                 self._event_queue.put(("error", str(exc)))
 
-        self._worker = threading.Thread(target=worker, name="VideoExporterWorker", daemon=True)
+        self._worker = threading.Thread(target=worker, name="FuelVideoWorker", daemon=True)
         self._worker.start()
 
     def _is_busy(self) -> bool:

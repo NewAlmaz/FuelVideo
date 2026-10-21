@@ -1,4 +1,4 @@
-# Зависимости VideoExporter.
+# Зависимости FuelVideo.
 #
 # Только openpyxl (чтение xlsx) и PyInstaller (сборка exe).
 # GUI — стандартный tkinter, ini — configparser, копирование — shutil.

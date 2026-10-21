@@ -1,6 +1,6 @@
 @echo off
 rem ============================================================================
-rem  Сборка VideoExporter.exe (Windows).
+rem  Сборка FuelVideo.exe (Windows).
 rem  Использование: просто запустить build.bat двойным щелчком.
 rem
 rem  Windows 10/11: подойдёт Python 3.11/3.12.
@@ -40,7 +40,7 @@ if errorlevel 1 (
 )
 
 echo [4/5] Сборка exe (PyInstaller)...
-call "venv\Scripts\pyinstaller.exe" --noconfirm --onefile --windowed --name VideoExporter ^
+call "venv\Scripts\pyinstaller.exe" --noconfirm --onefile --windowed --name FuelVideo ^
     --add-data "settings.ini;." ^
     --add-data "azs.ini;." ^
     --hidden-import openpyxl ^
@@ -53,7 +53,7 @@ if errorlevel 1 (
 
 echo [5/5] Готово.
 echo.
-echo exe: %~dp0dist\VideoExporter.exe
+echo exe: %~dp0dist\FuelVideo.exe
 echo Рядом с exe при первом запуске будут созданы settings.ini, azs.ini и папка logs.
 echo Если положить свои settings.ini и azs.ini рядом с exe — они будут использованы.
 echo.
