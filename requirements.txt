@@ -1,0 +1,11 @@
+# Зависимости VideoExporter.
+#
+# Только openpyxl (чтение xlsx) и PyInstaller (сборка exe).
+# GUI — стандартный tkinter, ini — configparser, копирование — shutil.
+# Тяжёлые библиотеки (pandas, PyQt, wxPython) намеренно не используются.
+openpyxl>=3.0
+
+# PyInstaller нужен только для сборки exe.
+# Windows 10/11: Python 3.11/3.12 + свежий PyInstaller.
+# Windows 7:     Python 3.8.10 + PyInstaller 5.13.2 (более новые версии Win7 не поддерживают).
+pyinstaller>=5.13.2
