@@ -16,6 +16,7 @@ import configparser
 import logging
 import queue
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -221,7 +222,13 @@ def get_base_dir() -> Path:
 
 
 def ensure_ini_files(base_dir: Path) -> Tuple[Path, Path]:
-    """Создать ini-файлы из встроенных шаблонов, если их ещё нет.
+    """Создать ini-файлы рядом с exe, если их ещё нет.
+
+    Источники в порядке приоритета:
+
+    1. уже существующий внешний файл — не трогаем;
+    2. файл, упакованный в exe (``--add-data``, распакован в ``sys._MEIPASS``);
+    3. встроенная строка-шаблон (:data:`DEFAULT_SETTINGS_INI` / :data:`DEFAULT_AZS_INI`).
 
     :param base_dir: каталог рядом с exe (или с исходниками)
     :return: кортеж (путь к settings.ini, путь к azs.ini)
@@ -230,13 +237,25 @@ def ensure_ini_files(base_dir: Path) -> Tuple[Path, Path]:
     settings_path = base_dir / "settings.ini"
     azs_path = base_dir / "azs.ini"
 
-    if not settings_path.exists():
-        settings_path.write_text(DEFAULT_SETTINGS_INI, encoding="utf-8")
-        LOGGER.info("Создан файл настроек по умолчанию: %s", settings_path)
-    if not azs_path.exists():
-        azs_path.write_text(DEFAULT_AZS_INI, encoding="utf-8")
-        LOGGER.info("Создан файл настроек АЗС по умолчанию: %s", azs_path)
+    def materialize(name: str, target: Path, fallback_text: str) -> None:
+        if target.exists():
+            # Внешний файл уже есть — не трогаем.
+            LOGGER.info("Используется существующий файл: %s", target)
+            return
+        bundled = Path(getattr(sys, "_MEIPASS", base_dir)) / name
+        try:
+            bundled_exists = bundled.exists() and bundled.resolve() != target.resolve()
+        except OSError:
+            bundled_exists = False
+        if bundled_exists:
+            shutil.copy2(bundled, target)
+            LOGGER.info("Создан %s из упакованного шаблона: %s", name, target)
+            return
+        target.write_text(fallback_text, encoding="utf-8")
+        LOGGER.info("Создан %s из встроенной строки: %s", name, target)
 
+    materialize("settings.ini", settings_path, DEFAULT_SETTINGS_INI)
+    materialize("azs.ini", azs_path, DEFAULT_AZS_INI)
     return settings_path, azs_path
 
 
