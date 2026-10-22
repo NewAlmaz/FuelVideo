@@ -24,7 +24,6 @@ from typing import List, Optional, Sequence
 import drives
 from config import (
     AppConfig,
-    AzsConfig,
     ConfigError,
     get_base_dir,
     load_config,
@@ -257,58 +256,148 @@ def show_error_dialog(title: str, message: str) -> None:
         pass
 
 
-def resolve_initial_azs(config: AppConfig) -> AzsConfig:
-    """Выбрать АЗС по правилам параметра ``current_azs``."""
-    current = parse_current_azs(config.general.current_azs)
-    if current is not None:
-        return config.get_azs(current)
-    if len(config.azs_list) == 1:
-        return config.azs_list[0]
-    # Несколько секций при auto: вернём первую, диалог покажет вызывающий код.
-    return config.azs_list[0]
+def resolve_azs_or_none(root: "tk.Misc", config: AppConfig) -> Optional[int]:
+    """Определить АЗС для работы.
 
+    Правила:
 
-def need_azs_dialog(config: AppConfig) -> bool:
-    """Нужно ли показывать диалог выбора АЗС."""
-    return parse_current_azs(config.general.current_azs) is None and len(config.azs_list) > 1
+    * ``current_azs=<число>`` — секция должна существовать, диалог не показывается;
+    * ``current_azs=auto`` и одна секция — возвращается её номер;
+    * ``current_azs=auto`` и ни одной секции — сообщение об ошибке и ``None``;
+    * ``current_azs=auto`` и несколько секций — модальный диалог выбора.
+
+    :param root: уже созданное (скрытое) главное окно — родитель для диалога
+    :param config: прочитанные настройки
+    :return: номер АЗС или ``None``, если работать не с чем
+    """
+    import gui  # импорт внутри функции: --selftest работает и без дисплея
+
+    try:
+        try:
+            current = parse_current_azs(config.general.current_azs)
+        except ConfigError as exc:
+            gui.show_error(root, "Ошибка настроек", str(exc))
+            return None
+
+        if current is not None:
+            if config.find_azs(current) is None:
+                available = (
+                    ", ".join(f"AZS_{number}" for number in config.azs_numbers) or "нет ни одной"
+                )
+                gui.show_error(
+                    root,
+                    "Секция АЗС не найдена",
+                    f"В azs.ini нет секции [AZS_{current}] (current_azs={current}).\n"
+                    f"Доступные секции: {available}.",
+                )
+                return None
+            LOGGER.info("current_azs=%s: диалог выбора АЗС не требуется.", current)
+            gui.log_startup(f"startup: current_azs={current}, dialog skipped")
+            return current
+
+        sections = list(config.azs_list)
+        if len(sections) == 1:
+            only = sections[0].number
+            LOGGER.info("current_azs=auto: в azs.ini одна секция — АЗС %s.", only)
+            gui.log_startup(f"startup: auto with a single section -> AZS {only}")
+            return only
+
+        if not sections:
+            gui.show_error(
+                root,
+                "Нет секций АЗС",
+                "В azs.ini нет ни одной секции вида [AZS_<номер>].\n"
+                "Добавьте секцию своей АЗС и запустите программу снова.",
+            )
+            return None
+
+        options = [(azs.number, gui.azs_option_label(azs)) for azs in sections]
+        chosen = gui.ask_azs_dialog(root, options)
+        if chosen is None:
+            LOGGER.info("Диалог выбора АЗС закрыт без выбора, выход.")
+            gui.log_startup("startup: AZS dialog cancelled, exit")
+            return None
+        gui.log_startup(f"startup: AZS dialog result {chosen}")
+        return chosen
+    except Exception as exc:  # любая неожиданная ошибка не должна вешать процесс
+        LOGGER.exception("Ошибка выбора АЗС: %s", exc)
+        gui.log_startup_exception("startup: exception in resolve_azs_or_none")
+        gui.show_error(
+            root,
+            "Ошибка выбора АЗС",
+            f"{exc}\n\nПодробности записаны в startup_debug.log.",
+        )
+        return None
 
 
 def run_gui(config: AppConfig, ui_queue: "queue.Queue[str]", xlsx_path: Optional[Path]) -> int:
     """Запустить графический интерфейс.
 
+    Порядок строго фиксирован:
+
+    1. создаётся ``root`` и сразу прячется;
+    2. выбирается АЗС (диалог / auto / номер из настроек);
+    3. к ``root`` применяется выбранная АЗС и собирается главное окно;
+    4. окно показывается и запускается единственный ``mainloop()``.
+
     :param config: настройки
     :param ui_queue: очередь для строк лога
     :param xlsx_path: заранее выбранный файл xlsx (может быть ``None``)
     """
+    import tkinter as tk
+
     import gui  # импорт внутри функции: --selftest работает и без дисплея
 
-    initial_azs = resolve_initial_azs(config)
-    app = gui.ExporterApp(config, initial_azs, ui_queue)
+    root = tk.Tk()
+    root.withdraw()  # прячем ГЛАВНОЕ окно, пока выбираем АЗС
+    log_path = gui._startup_debug_path()
+    gui.log_startup(
+        f"startup: app launch, current_azs={config.general.current_azs!r}, "
+        f"sections={config.azs_numbers}, debug_log={log_path}"
+    )
 
-    if need_azs_dialog(config):
-        app.withdraw()
-        chosen = gui.choose_azs_dialog(app, config.azs_list)
-        if chosen is None:
-            LOGGER.info("Диалог выбора АЗС отменён пользователем, выход.")
-            app.destroy()
-            return 1
-        app.set_azs(chosen)
-        app.deiconify()
+    azs_number = resolve_azs_or_none(root, config)  # см. п.2
+    if azs_number is None:
+        LOGGER.info("АЗС не выбрана, выход.")
+        gui.log_startup("startup: no AZS selected, exit")
+        root.destroy()
+        return 0
+
+    try:
+        azs = config.get_azs(azs_number)
+    except ConfigError as exc:
+        gui.show_error(root, "Ошибка настроек", str(exc))
+        root.destroy()
+        return 2
+
+    gui.apply_azs(root, azs)  # загрузить video_roots/output_root/trk_N
+    app = gui.build_main_window(root, config, ui_queue)  # собрать главное окно
 
     if xlsx_path is not None:
         app.load_xlsx(xlsx_path)
 
-    roots = drives.resolve_video_roots(config, app.azs)
-    LOGGER.info(
-        "Старт. current_azs=%s; выбрана АЗС: %s; video_roots=%s; output_root=%s; интервал: %s",
-        config.general.current_azs,
-        app.azs.number,
-        ", ".join(str(root) for root in roots) or "нет",
-        app.azs.output_root,
-        config.general.interval_text,
-    )
+    def log_resolution() -> None:
+        """Записать в лог итоговые корни видеоархива (может опрашивать диски)."""
+        try:
+            roots = drives.resolve_video_roots(config, app.azs)
+            roots_text = ", ".join(str(item) for item in roots) or "нет"
+            LOGGER.info(
+                "Старт. current_azs=%s; выбрана АЗС: %s; video_roots=%s; output_root=%s; интервал: %s",
+                config.general.current_azs,
+                app.azs.number,
+                roots_text,
+                app.azs.output_root,
+                config.general.interval_text,
+            )
+            gui.log_startup(f"startup: video_roots for AZS {app.azs.number}: {roots_text}")
+        except Exception:
+            LOGGER.exception("Не удалось определить корни видеоархива.")
+            gui.log_startup_exception("startup: failed to resolve video_roots")
 
-    app.mainloop()
+    root.deiconify()  # ПОКАЗАТЬ главное окно
+    root.after(100, log_resolution)
+    gui.log_startup("startup: main window shown, entering mainloop")
+    root.mainloop()  # единственный mainloop в программе
     return 0
 
 

@@ -17,13 +17,14 @@ import os
 import queue
 import threading
 import tkinter as tk
-from datetime import timedelta
+import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import drives
-from config import AppConfig, AzsConfig, ConfigError, load_config
+from config import AppConfig, AzsConfig, ConfigError, get_base_dir, load_config
 from copier import (
     JobRunner,
     RowResult,
@@ -61,82 +62,167 @@ TASKS_WIDTHS = {
 }
 
 
-class AzsChooser(tk.Toplevel):
-    """Модальный диалог выбора АЗС (показывается до главного окна или по кнопке)."""
+#: Имя файла диагностики запуска (лежит рядом с ini-файлами, пишется в append-режиме).
+STARTUP_DEBUG_FILE = "startup_debug.log"
 
-    def __init__(self, master: tk.Misc, azs_list: List[AzsConfig]) -> None:
-        super().__init__(master)
-        self.title("Выбор АЗС")
-        self.resizable(False, False)
-        self.result: Optional[AzsConfig] = None
-        self._azs_list = list(azs_list)
 
-        container = ttk.Frame(self, padding=12)
-        container.pack(fill="both", expand=True)
+def _startup_debug_path() -> Path:
+    """Путь к файлу startup_debug.log."""
+    return Path(get_base_dir()) / STARTUP_DEBUG_FILE
+
+
+def log_startup(message: str) -> None:
+    """Дописать строку в startup_debug.log (append).
+
+    :param message: текст без отметки времени
+    """
+    try:
+        with _startup_debug_path().open("a", encoding="utf-8") as stream:
+            stream.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}\n")
+    except Exception as exc:  # лог не должен ломать запуск программы
+        LOGGER.error("Не удалось записать %s: %s", STARTUP_DEBUG_FILE, exc)
+
+
+def log_startup_exception(prefix: str) -> None:
+    """Дописать в startup_debug.log сообщение и текущий трейсбек."""
+    try:
+        with _startup_debug_path().open("a", encoding="utf-8") as stream:
+            stream.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {prefix}\n")
+            traceback.print_exc(file=stream)
+    except Exception as exc:  # лог не должен ломать запуск программы
+        LOGGER.error("Не удалось записать %s: %s", STARTUP_DEBUG_FILE, exc)
+
+
+def show_error(parent: Optional[tk.Misc], title: str, message: str) -> None:
+    """Показать модальное окно ошибки и записать его в startup_debug.log."""
+    LOGGER.error("%s: %s", title, message)
+    log_startup(f"error: {title}: {message}")
+    try:
+        messagebox.showerror(title, message, parent=parent)
+    except Exception:
+        log_startup_exception("error: не удалось показать messagebox")
+
+
+def azs_option_label(azs: AzsConfig) -> str:
+    """Подпись строки списка выбора АЗС, например «АЗС 38 — D:\\VideoExport\\AZS38».
+
+    Строится только из номера секции и пути из azs.ini: диск НЕ опрашивается.
+    """
+    if azs.output_root_explicit:
+        return f"АЗС {azs.number} — {azs.output_root}"
+    return f"АЗС {azs.number} — (по умолчанию)"
+
+
+def _reset_topmost(window: tk.Misc) -> None:
+    """Снять признак «поверх всех окон» после первого показа диалога."""
+    try:
+        window.attributes("-topmost", False)
+    except tk.TclError:
+        pass
+
+
+def ask_azs_dialog(parent: tk.Misc, options: Sequence[Tuple[int, str]]) -> Optional[int]:
+    """Показать модальный диалог выбора АЗС.
+
+    :param parent: уже созданное главное окно (может быть скрыто)
+    :param options: список пар ``(номер АЗС, подпись)``
+    :return: номер выбранной АЗС или ``None`` (кнопка «Выход», крестик, ошибка)
+    """
+    result: Optional[int] = None
+    log_startup(f"dialog: opening, {len(options)} options")
+    try:
+        dlg = tk.Toplevel(parent)
+        dlg.title("FuelVideo — выберите АЗС")
+        # transient ставим только для ВИДИМОГО родителя: на Windows owned-окно
+        # скрытого (withdraw) родителя никогда не мапится, и тогда
+        # wait_visibility()/wait_window() зависают навсегда — окна не видно.
+        # Модальность в этом случае обеспечивают grab_set() и wait_window().
+        if parent.winfo_viewable():
+            dlg.transient(parent)
+        dlg.resizable(False, False)
+
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill="both", expand=True)
 
         ttk.Label(
-            container,
+            frame,
             text="Выберите АЗС, с которой будет работать программа:",
         ).pack(anchor="w", pady=(0, 8))
 
-        self._listbox = tk.Listbox(container, height=min(10, max(3, len(self._azs_list))), width=70)
-        for azs in self._azs_list:
-            self._listbox.insert("end", azs.title)
-        self._listbox.pack(fill="both", expand=True)
-        if self._azs_list:
-            self._listbox.selection_set(0)
-        self._listbox.bind("<Double-Button-1>", lambda _event: self._on_ok())
+        listbox = tk.Listbox(
+            frame,
+            height=min(10, max(3, len(options))),
+            width=70,
+            exportselection=False,
+        )
+        for _number, label in options:
+            listbox.insert("end", label)
+        listbox.pack(fill="both", expand=True)
+        if options:
+            listbox.selection_set(0)
+            listbox.see(0)
+            listbox.focus_set()
 
-        buttons = ttk.Frame(container)
+        buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(10, 0))
-        ttk.Button(buttons, text="Выбрать", command=self._on_ok).pack(side="right")
-        ttk.Button(buttons, text="Выход", command=self._on_cancel).pack(side="right", padx=(0, 8))
 
-        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
-        self.bind("<Return>", lambda _event: self._on_ok())
-        self.bind("<Escape>", lambda _event: self._on_cancel())
+        def on_ok(_event: Optional[tk.Event] = None) -> None:
+            """Зафиксировать выбор пользователя."""
+            nonlocal result
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showwarning("Выбор АЗС", "Выберите АЗС из списка.", parent=dlg)
+                return
+            result = options[selection[0]][0]
+            log_startup(f"dialog: user selected {result}")
+            dlg.destroy()
 
-        self.transient(master)
-        self.grab_set()
-        self.update_idletasks()
-        self._center_over_master(master)
-        self._listbox.focus_set()
+        def on_cancel(_event: Optional[tk.Event] = None) -> None:
+            """Закрыть диалог по кнопке «Выход»."""
+            nonlocal result
+            result = None
+            log_startup("dialog: user cancelled")
+            dlg.destroy()
 
-    def _center_over_master(self, master: tk.Misc) -> None:
-        """Расположить диалог по центру родительского окна (или экрана)."""
+        def on_window_close() -> None:
+            """Закрыть диалог крестиком."""
+            nonlocal result
+            result = None
+            log_startup("dialog: closed by window manager")
+            dlg.destroy()
+
+        ttk.Button(buttons, text="Выбрать", command=on_ok).pack(side="right")
+        ttk.Button(buttons, text="Выход", command=on_cancel).pack(side="right", padx=(0, 8))
+
+        dlg.protocol("WM_DELETE_WINDOW", on_window_close)
+        dlg.bind("<Return>", on_ok)
+        dlg.bind("<Escape>", on_cancel)
+        listbox.bind("<Double-Button-1>", on_ok)
+
+        # Порядок строго важен: сначала окно отрисовывается и показывается,
+        # только потом ставится grab_set и запускаются wait_visibility/wait_window.
+        dlg.update_idletasks()
+        dlg.deiconify()
+        dlg.lift()
+        dlg.attributes("-topmost", True)
+        dlg.after(100, lambda: _reset_topmost(dlg))
+        dlg.grab_set()
+        dlg.wait_visibility()
+        dlg.wait_window()
+    except Exception:
+        log_startup_exception("dialog: exception while showing the AZS dialog")
+        LOGGER.exception("Ошибка диалога выбора АЗС")
         try:
-            width = self.winfo_reqwidth()
-            height = self.winfo_reqheight()
-            if master.winfo_viewable():
-                x = master.winfo_rootx() + (master.winfo_width() - width) // 2
-                y = master.winfo_rooty() + (master.winfo_height() - height) // 2
-            else:
-                x = (self.winfo_screenwidth() - width) // 2
-                y = (self.winfo_screenheight() - height) // 3
-            self.geometry(f"+{max(0, x)}+{max(0, y)}")
-        except tk.TclError:
-            pass
-
-    def _on_ok(self) -> None:
-        """Зафиксировать выбор АЗС."""
-        selection = self._listbox.curselection()
-        if not selection:
-            messagebox.showwarning("Выбор АЗС", "Выберите АЗС из списка.", parent=self)
-            return
-        self.result = self._azs_list[selection[0]]
-        self.destroy()
-
-    def _on_cancel(self) -> None:
-        """Закрыть диалог без выбора."""
-        self.result = None
-        self.destroy()
-
-
-def choose_azs_dialog(master: tk.Misc, azs_list: List[AzsConfig]) -> Optional[AzsConfig]:
-    """Показать модальный диалог выбора АЗС и вернуть выбор (или ``None``)."""
-    dialog = AzsChooser(master, azs_list)
-    master.wait_window(dialog)
-    return dialog.result
+            messagebox.showerror(
+                "Ошибка выбора АЗС",
+                "Не удалось показать диалог выбора АЗС.\n"
+                f"Подробности записаны в {STARTUP_DEBUG_FILE}.",
+                parent=parent,
+            )
+        except Exception:
+            log_startup_exception("dialog: messagebox failed")
+        return None
+    return result
 
 
 class DetailsWindow(tk.Toplevel):
@@ -279,16 +365,23 @@ class DetailsWindow(tk.Toplevel):
             self.text.insert("end", "\n")
 
 
-class ExporterApp(tk.Tk):
-    """Главное окно приложения."""
+class ExporterApp(ttk.Frame):
+    """Содержимое главного окна внутри уже созданного ``root``.
+
+    Класс НЕ создаёт собственный ``tk.Tk`` и НЕ вызывает ``mainloop()``:
+    главное окно создаётся в ``main.py`` (``root = tk.Tk()``), сюда оно
+    передаётся готовым, а ``mainloop()`` запускается один раз в конце.
+    """
 
     def __init__(
         self,
+        root: tk.Tk,
         config: AppConfig,
         azs: AzsConfig,
         ui_queue: "queue.Queue[str]",
     ) -> None:
-        super().__init__()
+        super().__init__(root)
+        self.root = root
         self.config_data = config
         self.azs = azs
         self.ui_queue = ui_queue
@@ -303,17 +396,20 @@ class ExporterApp(tk.Tk):
         self._event_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
         self._reports: Tuple[Optional[Path], Optional[Path]] = (None, None)
 
-        self.title("FuelVideo — копирование видео и звука из СВН «Интеллект»")
-        self.geometry("1200x720")
-        self.minsize(980, 600)
+        self.root.title("FuelVideo — копирование видео и звука из СВН «Интеллект»")
+        self.root.geometry("1200x720")
+        self.root.minsize(980, 600)
 
         self._build_ui()
+        self.pack(fill="both", expand=True)
         self._update_azs_label()
-        self._rebuild_settings()
+        # Заполнение вкладки «Настройки» обращается к дискам (в т.ч. сетевым),
+        # поэтому выполняем его уже после того, как окно покажется на экране.
+        self.root.after(100, self._rebuild_settings)
 
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(120, self._poll_events)
-        self.after(200, self._poll_log)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(120, self._poll_events)
+        self.root.after(200, self._poll_log)
 
     # ------------------------------------------------------------------ #
     # Построение интерфейса
@@ -473,8 +569,17 @@ class ExporterApp(tk.Tk):
         if self._is_busy():
             messagebox.showwarning("Идёт обработка", "Дождитесь завершения или нажмите «Остановить».", parent=self)
             return
-        chosen = choose_azs_dialog(self, self.config_data.azs_list)
+        options = [(azs.number, azs_option_label(azs)) for azs in self.config_data.azs_list]
+        chosen_number = ask_azs_dialog(self.root, options)
+        if chosen_number is None:
+            return
+        chosen = self.config_data.find_azs(chosen_number)
         if chosen is None:
+            messagebox.showwarning(
+                "Секция АЗС не найдена",
+                f"В azs.ini нет секции [AZS_{chosen_number}].",
+                parent=self,
+            )
             return
         if chosen.number == self.azs.number:
             return
@@ -491,7 +596,7 @@ class ExporterApp(tk.Tk):
         drives.reset_cache()
         self._update_azs_label()
         self._rebuild_settings()
-        self.title(f"FuelVideo — АЗС {azs.number}")
+        self.root.title(f"FuelVideo — АЗС {azs.number}")
         LOGGER.info(
             "Выбрана АЗС: %s; output_root=%s; video_roots=%s",
             azs.number,
@@ -706,7 +811,7 @@ class ExporterApp(tk.Tk):
                     self._on_job_error(str(payload))
         except queue.Empty:
             pass
-        self.after(120, self._poll_events)
+        self.root.after(120, self._poll_events)
 
     def _poll_log(self) -> None:
         """Перелить строки лога из очереди в текстовое поле."""
@@ -721,7 +826,7 @@ class ExporterApp(tk.Tk):
             self.log_text.insert("end", "\n".join(messages) + "\n")
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
-        self.after(200, self._poll_log)
+        self.root.after(200, self._poll_log)
 
     # ------------------------------------------------------------------ #
     # Обновление таблицы
@@ -961,4 +1066,54 @@ class ExporterApp(tk.Tk):
                 return
             self._stop_event.set()
         LOGGER.info("Приложение закрыто пользователем.")
-        self.destroy()
+        log_startup("startup: main window closed by user")
+        self.root.destroy()
+
+
+# --------------------------------------------------------------------------- #
+# Запуск главного окна на уже созданном root
+# --------------------------------------------------------------------------- #
+def apply_azs(root: tk.Misc, azs: AzsConfig) -> None:
+    """Загрузить в главное окно выбранную АЗС: output_root, video_roots, trk_N.
+
+    Ничего не рисует и не опрашивает диски — только фиксирует выбор,
+    который затем подхватит :func:`build_main_window`.
+
+    :param root: главное окно, созданное в ``main.py``
+    :param azs: выбранная секция ``[AZS_<номер>]``
+    """
+    root._fuelvideo_azs = azs  # type: ignore[attr-defined]
+    drives.reset_cache()
+    root.title(f"FuelVideo — АЗС {azs.number}")
+    LOGGER.info(
+        "Применена АЗС: %s; output_root=%s; video_roots=%s; ТРК: %s",
+        azs.number,
+        azs.output_root,
+        ", ".join(str(item) for item in azs.video_roots) if azs.video_roots else "auto",
+        ", ".join(str(trk) for trk in sorted(azs.trk_map)) or "нет",
+    )
+    log_startup(f"startup: azs applied {azs.number}")
+
+
+def build_main_window(
+    root: tk.Misc,
+    config: AppConfig,
+    ui_queue: "queue.Queue[str]",
+) -> ExporterApp:
+    """Собрать главное окно внутри уже созданного ``root`` (ровно один раз).
+
+    :param root: главное окно, созданное в ``main.py``
+    :param config: полные настройки
+    :param ui_queue: очередь строк лога для вкладки «Лог»
+    :return: экземпляр :class:`ExporterApp`
+    """
+    existing = getattr(root, "_fuelvideo_app", None)
+    if isinstance(existing, ExporterApp):
+        return existing
+    azs = getattr(root, "_fuelvideo_azs", None)
+    if azs is None:
+        azs = config.azs_list[0]
+    app = ExporterApp(root, config, azs, ui_queue)
+    root._fuelvideo_app = app  # type: ignore[attr-defined]
+    log_startup("startup: main window built")
+    return app
