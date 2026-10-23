@@ -411,7 +411,7 @@ class ExporterApp(ttk.Frame):
         self._saved_date: Optional[date] = None
         self._rollback_notified: bool = False
 
-        APP_VERSION = "0.1.0"
+        APP_VERSION = "1.0.0"
         self.root.title(f"FuelVideo — копирование видео и звука из СВН «Интеллект» v{APP_VERSION}")
         self.root.geometry("1200x720")
         self.root.minsize(980, 600)
