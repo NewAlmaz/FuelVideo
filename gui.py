@@ -25,6 +25,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import drives
 from config import AppConfig, AzsConfig, ConfigError, get_base_dir, load_config
+from expiry import (
+    check_clock_rollback,
+    expiry_text,
+    is_expired,
+    verify_unlock_password,
+)
+from license import UNLOCK_PASSWORD_HASH
 from copier import (
     JobRunner,
     RowResult,
@@ -395,6 +402,10 @@ class ExporterApp(ttk.Frame):
         self._stop_event = threading.Event()
         self._event_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
         self._reports: Tuple[Optional[Path], Optional[Path]] = (None, None)
+        # Мягкий предохранитель срока действия (см. license.py / expiry.py):
+        # разблокировка живёт только до конца текущей сессии.
+        self._unlocked: bool = False
+        self._clock_rollback: bool = False
 
         APP_VERSION = "0.1.0"
         self.root.title(f"FuelVideo — копирование видео и звука из СВН «Интеллект» v{APP_VERSION}")
@@ -411,6 +422,8 @@ class ExporterApp(ttk.Frame):
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(120, self._poll_events)
         self.root.after(200, self._poll_log)
+
+        self._apply_expiry_state()
 
     # ------------------------------------------------------------------ #
     # Построение интерфейса
@@ -439,6 +452,13 @@ class ExporterApp(ttk.Frame):
         self.azs_var = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.azs_var, font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Button(top, text="Сменить АЗС", command=self.on_switch_azs).pack(side="left", padx=6)
+        self.unlock_button = ttk.Button(
+            top,
+            text="Ввести код разблокировки",
+            command=self.on_unlock,
+            state="disabled",
+        )
+        self.unlock_button.pack(side="left", padx=(0, 6))
         ttk.Button(top, text="Выбрать xlsx", command=self.on_choose_xlsx).pack(side="left", padx=(12, 6))
 
         self.xlsx_var = tk.StringVar(value="файл xlsx не выбран")
@@ -605,12 +625,32 @@ class ExporterApp(ttk.Frame):
             ", ".join(str(item) for item in azs.video_roots) if azs.video_roots else "auto",
         )
 
+    def _expiry_allows(self) -> bool:
+        """Разрешено ли действие мягким предохранителем срока действия.
+
+        :return: ``True``, если работа разрешена; иначе показывает окно и
+            возвращает ``False``
+        """
+        if (is_expired() or self._clock_rollback) and not self._unlocked:
+            messagebox.showwarning(
+                "Срок истёк",
+                f"Срок действия программы истёк ({expiry_text()}). "
+                "Копирование заблокировано.\nВведите код разблокировки.",
+                parent=self,
+            )
+            return False
+        return True
+
     def on_scan(self) -> None:
         """Запустить сканирование без копирования."""
+        if not self._expiry_allows():
+            return
         self._start_job(scan_only=True)
 
     def on_copy(self) -> None:
         """Запустить копирование с подтверждением."""
+        if not self._expiry_allows():
+            return
         if self._is_busy():
             messagebox.showwarning("Идёт обработка", "Дождитесь завершения текущей задачи.", parent=self)
             return
@@ -787,10 +827,126 @@ class ExporterApp(ttk.Frame):
         return self._worker is not None and self._worker.is_alive()
 
     def _set_buttons_enabled(self, enabled: bool) -> None:
-        """Заблокировать/разблокировать кнопки запуска."""
-        state = "normal" if enabled else "disabled"
+        """Заблокировать/разблокировать кнопки запуска.
+
+        Блокировка по сроку действия имеет приоритет: после завершения задачи
+        кнопки не включаются, если предохранитель сработал.
+        """
+        expiry_blocked = (is_expired() or self._clock_rollback) and not self._unlocked
+        state = "normal" if enabled and not expiry_blocked else "disabled"
         self.scan_button.configure(state=state)
         self.copy_button.configure(state=state)
+
+    # ------------------------------------------------------------------ #
+    # Мягкий предохранитель срока действия
+    # ------------------------------------------------------------------ #
+    def _apply_expiry_state(self) -> None:
+        """Применить состояние предохранителя к кнопкам и строке статуса.
+
+        Срок проверяется здесь же (часы могли откатить между запусками),
+        поэтому метод вызывается и при старте, и после разблокировки.
+        """
+        self._clock_rollback = check_clock_rollback()
+        expired = is_expired() or self._clock_rollback
+        blocked = expired and not self._unlocked
+
+        if blocked:
+            self.copy_button.configure(state="disabled")
+            self.scan_button.configure(state="disabled")
+            self.unlock_button.configure(state="normal")
+            if self._clock_rollback:
+                self.status_var.set(
+                    "Обнаружен откат системных часов. Копирование заблокировано. "
+                    "Введите код разблокировки."
+                )
+            else:
+                self.status_var.set(
+                    f"Срок действия истёк ({expiry_text()}). Копирование заблокировано."
+                )
+            LOGGER.warning(
+                "expiry: блокировка (expired=%s, clock_rollback=%s)",
+                is_expired(),
+                self._clock_rollback,
+            )
+        else:
+            self.copy_button.configure(state="normal")
+            self.scan_button.configure(state="normal")
+            self.unlock_button.configure(state="disabled")
+            if self._unlocked:
+                self.status_var.set("Разблокировано до конца сессии")
+            LOGGER.info("expiry: активен %s, clock_rollback=False", expiry_text())
+
+    def on_unlock(self) -> None:
+        """Запросить код разблокировки (модальный диалог)."""
+        if not UNLOCK_PASSWORD_HASH:
+            messagebox.showerror(
+                "Разблокировка недоступна",
+                "В сборке не задан пароль разблокировки.",
+                parent=self,
+            )
+            return
+
+        try:
+            dialog = tk.Toplevel(self.root)
+            dialog.title("FuelVideo — разблокировка")
+            if self.root.winfo_viewable():
+                dialog.transient(self.root)
+            dialog.resizable(False, False)
+
+            frame = ttk.Frame(dialog, padding=12)
+            frame.pack(fill="both", expand=True)
+            ttk.Label(
+                frame,
+                text="Введите код разблокировки:",
+            ).pack(anchor="w", pady=(0, 6))
+
+            password_var = tk.StringVar()
+            entry = ttk.Entry(frame, textvariable=password_var, show="*", width=40)
+            entry.pack(fill="x")
+            entry.focus_set()
+
+            def try_unlock() -> None:
+                """Проверить код и при успехе снять блокировку до конца сессии."""
+                if verify_unlock_password(password_var.get()):
+                    self._unlocked = True
+                    self._clock_rollback = False
+                    LOGGER.info("expiry: разблокировано по паролю")
+                    _close()
+                    self._apply_expiry_state()
+                    messagebox.showinfo(
+                        "Разблокировка",
+                        "Программа разблокирована до конца сессии.",
+                        parent=self,
+                    )
+                else:
+                    LOGGER.warning("expiry: неверный код")
+                    messagebox.showerror(
+                        "Ошибка",
+                        "Неверный код разблокировки.",
+                        parent=dialog,
+                    )
+                    entry.select_range(0, "end")
+                    entry.focus_set()
+
+            def _close() -> None:
+                """Закрыть диалог, сняв захват ввода."""
+                try:
+                    dialog.grab_release()
+                except tk.TclError:
+                    pass
+                dialog.destroy()
+
+            buttons = ttk.Frame(frame)
+            buttons.pack(fill="x", pady=(10, 0))
+            ttk.Button(buttons, text="Разблокировать", command=try_unlock).pack(side="left")
+            ttk.Button(buttons, text="Отмена", command=_close).pack(side="left", padx=6)
+
+            entry.bind("<Return>", lambda _event: try_unlock())
+            dialog.protocol("WM_DELETE_WINDOW", _close)
+            dialog.grab_set()
+            dialog.wait_window()
+        except tk.TclError as exc:  # диалог не должен ломать главное окно
+            LOGGER.error("Не удалось открыть диалог разблокировки: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Опрос очередей

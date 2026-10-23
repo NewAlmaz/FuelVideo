@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 import drives
+import expiry
 from config import (
     AppConfig,
     ConfigError,
@@ -133,6 +134,12 @@ def run_selftest(config: AppConfig, xlsx_path: Optional[Path]) -> int:
     :return: 0, если хотя бы одна строка обработана без ошибок, иначе 1
     """
     print("=== FuelVideo: самотестирование ===")
+    print()
+    print(f"Срок действия: {expiry.expiry_text()}", end="")
+    if expiry.is_expired():
+        print(" (ИСТЁК, копирование заблокировано)")
+    else:
+        print()
     print()
 
     parsed_current = parse_current_azs(config.general.current_azs)
@@ -350,6 +357,21 @@ def run_gui(config: AppConfig, ui_queue: "queue.Queue[str]", xlsx_path: Optional
 
     root = tk.Tk()
     root.withdraw()  # прячем ГЛАВНОЕ окно, пока выбираем АЗС
+    clock_rollback = expiry.check_clock_rollback()
+    if expiry.is_expired():
+        LOGGER.warning(
+            "expiry: %s, expired=%s, clock_rollback=%s",
+            expiry.expiry_text(),
+            True,
+            clock_rollback,
+        )
+    else:
+        LOGGER.info(
+            "expiry: %s, expired=%s, clock_rollback=%s",
+            expiry.expiry_text(),
+            False,
+            clock_rollback,
+        )
     log_path = gui._startup_debug_path()
     gui.log_startup(
         f"startup: app launch, current_azs={config.general.current_azs!r}, "
