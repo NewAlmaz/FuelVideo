@@ -24,8 +24,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import drives
-from config import AppConfig, AzsConfig, ConfigError
-from video_finder import FoundFile, SearchStats, find_files
+from config import AppConfig, AzsConfig, ConfigError, FinderConfig, GeneralConfig
+from video_finder import FoundFile, SearchResult, SearchStats, find_files
 from xlsx_reader import RowData
 
 LOGGER = logging.getLogger(__name__)
@@ -219,6 +219,203 @@ def copy_one(
     return status, dst, ""
 
 
+# --------------------------------------------------------------------------- #
+# Общие операции для xlsx-режима и ручного копирования
+# --------------------------------------------------------------------------- #
+def search_files_for_cameras(
+    azs: AzsConfig,
+    cameras: Sequence[str],
+    start: datetime,
+    end: datetime,
+    finder_cfg: FinderConfig,
+    video_roots: Sequence[Path],
+    include_audio: bool = True,
+    log_examples: bool = False,
+) -> SearchResult:
+    """Найти файлы камер за точный интервал ``[start; end]`` (сo статистикой).
+
+    Общая функция для вкладки «Задания» (xlsx) и вкладки «Ручное копирование».
+    Никаких ``minutes_before``/``minutes_after`` здесь нет: интервал передаётся
+    готовым. Сдвиг часов видео-сервера берётся из ``finder_cfg``
+    (``mtime_fix_sec`` + ``clock_drift_minutes`` * 60).
+
+    :param azs: текущая АЗС (для лога)
+    :param cameras: номера камер в формате ``07``
+    :param start: начало интервала
+    :param end: конец интервала
+    :param finder_cfg: параметры поиска
+    :param video_roots: корни видеоархива
+    :param include_audio: искать ли аудиофайлы
+    :param log_examples: вывести в лог примеры найденных путей
+    :return: :class:`video_finder.SearchResult` (файлы + статистика обхода)
+    """
+    if not cameras or not video_roots:
+        return SearchResult()
+
+    LOGGER.debug(
+        "Поиск: АЗС %s, камеры %s, интервал %s..%s, сдвиг %.1f c",
+        azs.number,
+        ",".join(cameras),
+        start.strftime("%d.%m.%Y %H:%M:%S"),
+        end.strftime("%d.%m.%Y %H:%M:%S"),
+        finder_cfg.total_offset_sec,
+    )
+
+    return find_files(
+        video_roots=video_roots,
+        cameras=cameras,
+        start=start,
+        end=end,
+        finder_cfg=finder_cfg,
+        include_audio=include_audio,
+        log_examples=log_examples,
+    )
+
+
+def find_files_for_cameras(
+    azs: AzsConfig,
+    cameras: Sequence[str],
+    start: datetime,
+    end: datetime,
+    finder_cfg: FinderConfig,
+    video_roots: Sequence[Path],
+    include_audio: bool = True,
+    log_examples: bool = False,
+) -> List[FoundFile]:
+    """Найти файлы камер за точный интервал ``[start; end]``.
+
+    Обёртка над :func:`search_files_for_cameras` для случаев, когда нужен
+    только список файлов (ручное копирование).
+
+    :return: список найденных файлов
+    """
+    return search_files_for_cameras(
+        azs=azs,
+        cameras=cameras,
+        start=start,
+        end=end,
+        finder_cfg=finder_cfg,
+        video_roots=video_roots,
+        include_audio=include_audio,
+        log_examples=log_examples,
+    ).files
+
+
+def copy_found_files(
+    files: Sequence[FoundFile],
+    azs: AzsConfig,
+    general_cfg: GeneralConfig,
+    stop_event: Optional[object] = None,
+    on_file: Optional[Callable[[CopyRecord], None]] = None,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    row_index: int = 0,
+    trk: Optional[int] = None,
+    docdate: Optional[datetime] = None,
+) -> List[CopyRecord]:
+    """Скопировать найденные файлы «зеркалом источника».
+
+    Общая функция для xlsx-режима и ручного копирования: вся логика
+    ``copy2`` / ``already_exists`` / ``duplicate_in_run`` /
+    ``size_mismatch_overwritten`` живёт здесь (:func:`copy_one`).
+
+    :param files: найденные файлы
+    :param azs: текущая АЗС (используется ``output_root``)
+    :param general_cfg: общие настройки (``copy_mode``, ``threads``)
+    :param stop_event: объект с методом ``is_set()`` для остановки
+    :param on_file: колбэк после каждого файла, получает :class:`CopyRecord`
+    :param on_progress: колбэк ``(обработано, всего)``
+    :param row_index: номер строки для отчёта (строка xlsx или ручная строка)
+    :param trk: номер ТРК для отчёта (если известен)
+    :param docdate: время заправки/начало интервала для отчёта
+    :return: записи отчёта по каждому файлу
+    """
+    output_root = Path(azs.output_root)
+    mode = general_cfg.copy_mode
+    threads = max(1, int(general_cfg.threads))
+    items = list(files)
+    total = len(items)
+    records: List[CopyRecord] = []
+    # Внутри одного прогона один и тот же файл не копируется дважды
+    # (например, если ТРК 1 и ТРК 2 ссылаются на одну камеру).
+    seen_src: set = set()
+
+    def stopped() -> bool:
+        return stop_event is not None and bool(getattr(stop_event, "is_set", lambda: False)())
+
+    def make_record(
+        item: FoundFile, status: str, dst: Optional[Path], error: str
+    ) -> CopyRecord:
+        return CopyRecord(
+            row_index=row_index,
+            azs=azs.number,
+            docdate=docdate,
+            trk=trk,
+            camera=item.camera,
+            kind=item.kind,
+            src=item.src,
+            dst=dst,
+            status=status,
+            error=error,
+        )
+
+    def handle(item: FoundFile, outcome: Tuple[str, Path, str]) -> None:
+        status, dst, error = outcome
+        if status == STATUS_SIZE_MISMATCH:
+            LOGGER.warning("Перезаписан файл с другим размером: %s", dst)
+        key = str(item.src).lower()
+        if status in (STATUS_COPIED, STATUS_SIZE_MISMATCH) and key in seen_src:
+            LOGGER.debug("Файл уже скопирован в этом прогоне: %s", item.src)
+            status, error = STATUS_ALREADY_EXISTS, ""
+        if status in (STATUS_COPIED, STATUS_SIZE_MISMATCH, STATUS_ALREADY_EXISTS):
+            seen_src.add(key)
+        record = make_record(item, status, dst, error)
+        records.append(record)
+        if on_progress is not None:
+            on_progress(len(records), total)
+        if on_file is not None:
+            on_file(record)
+
+    try:
+        pending = [item for item in items]
+        if threads > 1 and total > 1:
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                pairs = []
+                for item in pending:
+                    if stopped():
+                        break
+                    future = executor.submit(
+                        copy_one, item.src, item.video_root, output_root, mode
+                    )
+                    pairs.append((item, future))
+                for item, future in pairs:
+                    try:
+                        outcome = future.result()
+                    except Exception as exc:  # защита от неожиданных ошибок потока
+                        outcome = (
+                            STATUS_ERROR,
+                            destination_for(item.src, item.video_root, output_root),
+                            f"Ошибка копирования: {exc}",
+                        )
+                    handle(item, outcome)
+        else:
+            for item in pending:
+                if stopped():
+                    break
+                try:
+                    outcome = copy_one(item.src, item.video_root, output_root, mode)
+                except Exception as exc:  # защита от неожиданных ошибок
+                    outcome = (
+                        STATUS_ERROR,
+                        destination_for(item.src, item.video_root, output_root),
+                        f"Ошибка копирования: {exc}",
+                    )
+                handle(item, outcome)
+    except OSError as exc:
+        LOGGER.error("Ошибка копирования: %s", exc)
+
+    return records
+
+
 class JobRunner:
     """Обработка строк xlsx для одной выбранной АЗС."""
 
@@ -335,12 +532,13 @@ class JobRunner:
             LOGGER.warning(result.error)
             return result
 
-        search = find_files(
-            video_roots=video_roots,
+        search = search_files_for_cameras(
+            azs=self.azs,
             cameras=cameras,
             start=result.start,
             end=result.end,
             finder_cfg=self.config.finder,
+            video_roots=video_roots,
             include_audio=self.config.general.include_audio,
             log_examples=not self._examples_logged,
         )
@@ -376,39 +574,15 @@ class JobRunner:
     # ------------------------------------------------------------------ #
     def _copy_row_files(self, result: RowResult, stop_event: Optional[object] = None) -> None:
         """Скопировать найденные файлы строки и заполнить записи отчёта."""
-        output_root = self.azs.output_root
-        mode = self.config.general.copy_mode
-        threads = max(1, int(self.config.general.threads))
-
-        tasks: List[FoundFile] = []
-        for item in result.files:
-            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                break
-            tasks.append(item)
-
-        def copy_item(item: FoundFile) -> CopyRecord:
-            status, dst, error = copy_one(item.src, item.video_root, output_root, mode)
-            if status == STATUS_SIZE_MISMATCH:
-                LOGGER.warning("Перезаписан файл с другим размером: %s", dst)
-            return CopyRecord(
-                row_index=result.row.index,
-                azs=result.row.azs,
-                docdate=result.row.docdate,
-                trk=result.row.trk,
-                camera=item.camera,
-                kind=item.kind,
-                src=item.src,
-                dst=dst,
-                status=status,
-                error=error,
-            )
-
-        if threads > 1 and len(tasks) > 1:
-            with ThreadPoolExecutor(max_workers=threads) as executor:
-                records = list(executor.map(copy_item, tasks))
-        else:
-            records = [copy_item(item) for item in tasks]
-
+        records = copy_found_files(
+            files=result.files,
+            azs=self.azs,
+            general_cfg=self.config.general,
+            stop_event=stop_event,
+            row_index=result.row.index,
+            trk=result.row.trk,
+            docdate=result.row.docdate,
+        )
         result.records.extend(records)
 
         # Отметить камеры, по которым вообще не нашлось файлов нужного типа.

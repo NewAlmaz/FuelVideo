@@ -106,6 +106,16 @@ def print_config_summary(config: AppConfig) -> None:
             finder.mtime_fix_sec,
         )
     )
+    drift = float(getattr(finder, "clock_drift_minutes", 0.0) or 0.0)
+    if abs(drift) < 1e-9:
+        drift_text = "без сдвига"
+    elif drift > 0:
+        drift_text = f"часы видео-сервера отстают на {drift:g} мин (к mtime прибавляется сдвиг)"
+    else:
+        drift_text = (
+            f"часы видео-сервера спешат на {abs(drift):g} мин (из mtime вычитается сдвиг)"
+        )
+    print(f"clock_drift       : {drift:g} мин ({drift_text})")
     print(f"skip_dirs         : {', '.join(finder.skip_dirs)}")
     print()
 

@@ -88,6 +88,13 @@ video_suffix_audio=.wNN
 segment_duration_sec=60
 ; Поправка к времени файла, сек (может быть отрицательной)
 mtime_fix_sec=0
+; Сдвиг часов видео-сервера относительно реального времени, минут.
+;   >0  — часы на видео-сервере ОТСТАЮТ (mtime меньше реального; прибавляем N минут)
+;   <0  — часы СПЕШАТ (mtime больше реального; вычитаем N минут)
+;   0   — без сдвига
+; Применяется и к xlsx-режиму, и к ручному копированию.
+; Для точной подстройки в секундах есть mtime_fix_sec.
+clock_drift_minutes=0
 ; Служебные каталоги первого уровня, которые обходить нельзя
 skip_dirs=META,PROTECTED,INDEX_DATA
 """
@@ -148,6 +155,7 @@ class FinderConfig:
     video_suffix_audio: str
     segment_duration_sec: float
     mtime_fix_sec: float
+    clock_drift_minutes: float
     skip_dirs: List[str]
     compiled_path_date_regex: Optional["re.Pattern[str]"] = None
 
@@ -155,6 +163,15 @@ class FinderConfig:
     def skip_dirs_upper(self) -> List[str]:
         """Служебные каталоги в верхнем регистре для быстрого сравнения."""
         return [name.upper() for name in self.skip_dirs]
+
+    @property
+    def total_offset_sec(self) -> float:
+        """Суммарный сдвиг времени файла, сек.
+
+        Учитывает и точную поправку ``mtime_fix_sec``, и сдвиг часов
+        видео-сервера ``clock_drift_minutes`` (минуты переводятся в секунды).
+        """
+        return self.mtime_fix_sec + self.clock_drift_minutes * 60.0
 
 
 @dataclass
@@ -475,6 +492,8 @@ def _load_finder(parser: configparser.ConfigParser, source: str) -> FinderConfig
 
     segment_duration = _get_float(parser, "finder", "segment_duration_sec", source, minimum=0.0)
     mtime_fix = _get_float(parser, "finder", "mtime_fix_sec", source)
+    # Сдвиг часов может быть отрицательным, поэтому minimum не задаём.
+    clock_drift = _get_float(parser, "finder", "clock_drift_minutes", source)
     skip_dirs_raw = _get(parser, "finder", "skip_dirs", source)
     skip_dirs = [name.strip() for name in skip_dirs_raw.replace(";", ",").split(",") if name.strip()]
 
@@ -487,6 +506,7 @@ def _load_finder(parser: configparser.ConfigParser, source: str) -> FinderConfig
         video_suffix_audio=suffix_audio,
         segment_duration_sec=segment_duration,
         mtime_fix_sec=mtime_fix,
+        clock_drift_minutes=clock_drift,
         skip_dirs=skip_dirs,
         compiled_path_date_regex=compiled,
     )

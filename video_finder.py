@@ -9,7 +9,8 @@
    не пересекающиеся с грубым интервалом, не открываются.
 4. Файлы читаются без рекурсии; камера и тип определяются только по суффиксу
    (``._NN`` — видео, ``.wNN`` — звук).
-5. Время файла берётся из ``mtime`` (+ ``mtime_fix_sec``), и файл попадает в
+5. Время файла берётся из ``mtime`` плюс суммарный сдвиг
+   (``mtime_fix_sec`` + ``clock_drift_minutes`` * 60), и файл попадает в
    результат, если его сегмент пересекается с точным интервалом ``[start; end]``.
 """
 
@@ -158,7 +159,12 @@ def build_suffix_map(
 
 
 def _file_timestamp(path: Path, finder_cfg: FinderConfig) -> Optional[datetime]:
-    """Время файла: ``mtime`` или ``ctime`` плюс поправка ``mtime_fix_sec``."""
+    """Время файла: ``mtime`` или ``ctime`` плюс суммарный сдвиг.
+
+    Суммарный сдвиг — это ``mtime_fix_sec`` (точная подстройка в секундах)
+    плюс ``clock_drift_minutes`` * 60 (сдвиг часов видео-сервера).
+    См. :attr:`config.FinderConfig.total_offset_sec`.
+    """
     try:
         stat = path.stat()
     except OSError as exc:
@@ -171,7 +177,7 @@ def _file_timestamp(path: Path, finder_cfg: FinderConfig) -> Optional[datetime]:
     except (OverflowError, OSError, ValueError) as exc:
         LOGGER.warning("Не удалось преобразовать время файла %s: %s", path, exc)
         return None
-    return stamp + timedelta(seconds=finder_cfg.mtime_fix_sec)
+    return stamp + timedelta(seconds=finder_cfg.total_offset_sec)
 
 
 def _file_matches_interval(

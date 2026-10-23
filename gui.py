@@ -41,6 +41,7 @@ from copier import (
     status_label,
     write_reports,
 )
+from manual_tab import ManualTab, format_minutes
 from video_finder import FoundFile
 from xlsx_reader import RowData, XlsxError, read_rows
 
@@ -441,6 +442,12 @@ class ExporterApp(ttk.Frame):
         self.settings_tab = ttk.Frame(self.notebook, padding=6)
         self.log_tab = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(self.tasks_tab, text="Задания")
+
+        # Вкладка «Ручное копирование» живёт в отдельном модуле manual_tab.py,
+        # но ей нужен доступ к настройкам и текущей АЗС — передаём self.
+        self.manual_tab = ManualTab(self.notebook, self)
+        self.notebook.add(self.manual_tab, text="Ручное копирование")
+
         self.notebook.add(self.settings_tab, text="Настройки")
         self.notebook.add(self.log_tab, text="Лог")
 
@@ -621,6 +628,7 @@ class ExporterApp(ttk.Frame):
         drives.reset_cache()
         self._update_azs_label()
         self._rebuild_settings()
+        self.manual_tab.on_config_changed()
         self.root.title(f"FuelVideo — АЗС {azs.number}")
         LOGGER.info(
             "Выбрана АЗС: %s; output_root=%s; video_roots=%s",
@@ -628,6 +636,14 @@ class ExporterApp(ttk.Frame):
             azs.output_root,
             ", ".join(str(item) for item in azs.video_roots) if azs.video_roots else "auto",
         )
+
+    def expiry_allows(self) -> bool:
+        """Публичная проверка срока действия (для вкладки «Ручное копирование»)."""
+        return self._expiry_allows()
+
+    def expiry_blocked(self) -> bool:
+        """Публичная проверка блокировки по сроку для других вкладок."""
+        return self._expiry_blocked()
 
     def _expiry_allows(self) -> bool:
         """Разрешено ли действие мягким предохранителем срока действия.
@@ -739,6 +755,7 @@ class ExporterApp(ttk.Frame):
         self.azs = azs
         self._update_azs_label()
         self._rebuild_settings()
+        self.manual_tab.on_config_changed()
         self.status_var.set("Настройки перечитаны")
         LOGGER.info("Настройки перечитаны из ini.")
 
@@ -854,6 +871,9 @@ class ExporterApp(ttk.Frame):
         state = "normal" if enabled and not self._expiry_blocked() else "disabled"
         self.scan_button.configure(state=state)
         self.copy_button.configure(state=state)
+        manual = getattr(self, "manual_tab", None)
+        if manual is not None:
+            manual.refresh_expiry_state()
 
     # ------------------------------------------------------------------ #
     # Мягкий предохранитель срока действия
@@ -915,6 +935,10 @@ class ExporterApp(ttk.Frame):
             self.root.after(
                 300, lambda: self._notify_rollback(blocked, rollback, saved_date)
             )
+
+        manual = getattr(self, "manual_tab", None)
+        if manual is not None:
+            manual.refresh_expiry_state()
 
     def _notify_rollback(
         self, blocked: bool, rollback: bool, saved_date: Optional[date]
@@ -1213,6 +1237,14 @@ class ExporterApp(ttk.Frame):
         line(f"video_suffix_audio = {finder.video_suffix_audio}")
         line(f"segment_duration_sec = {finder.segment_duration_sec}")
         line(f"mtime_fix_sec = {finder.mtime_fix_sec}")
+        drift = float(getattr(finder, "clock_drift_minutes", 0.0) or 0.0)
+        if abs(drift) < 1e-9:
+            drift_text = "без сдвига"
+        elif drift > 0:
+            drift_text = f"часы отстают на {format_minutes(drift)} мин"
+        else:
+            drift_text = f"часы спешат на {format_minutes(-drift)} мин"
+        line(f"clock_drift_minutes = {format_minutes(drift)} ({drift_text})")
         line(f"skip_dirs = {', '.join(finder.skip_dirs)}")
         text.insert("end", "\n")
 
