@@ -1,7 +1,9 @@
-"""Вкладка «Ручное копирование» — копирование без xlsx, по параметрам вручную.
+"""Вкладка «Ручное копирование» — копирование по параметрам, заданным вручную.
 
-Пользователь задаёт интервал (начало/конец) и список ТРК, добавляет строки в
-таблицу, затем нажимает «Найти все» (только проверка) или «Копировать все».
+Пользователь задаёт интервал (начало/конец), список ТРК и АЗС, добавляет строки
+в таблицу, затем нажимает «Найти все» (только проверка) или «Копировать все».
+Таблицу строк можно импортировать из xlsx и экспортировать обратно
+(см. :mod:`manual_xlsx`).
 
 Логика поиска и копирования не дублируется: используются общие функции
 :func:`copier.find_files_for_cameras` и :func:`copier.copy_found_files`
@@ -22,10 +24,10 @@ import queue
 import re
 import threading
 import tkinter as tk
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import drives
@@ -41,12 +43,19 @@ from copier import (
     find_files_for_cameras,
     status_label,
 )
+from manual_xlsx import (
+    DATETIME_FORMAT,
+    ManualRow,
+    detect_xlsx_format,
+    parse_dt_text,
+    read_manual_xlsx,
+    write_manual_xlsx,
+)
 from video_finder import FoundFile
+from xlsx_reader import XlsxError
 
 LOGGER = logging.getLogger(__name__)
 
-#: Формат даты-времени в полях ввода (без секунд).
-DATETIME_FORMAT = "%Y-%m-%d %H:%M"
 DATETIME_HINT = (
     "Неверный формат. Ожидается YYYY-MM-DD HH:MM, например 2026-09-17 13:28"
 )
@@ -58,15 +67,23 @@ WILL_COPY_LABEL = "будет скопировано"
 #: Колонки CSV-отчёта ручного копирования.
 MANUAL_REPORT_COLUMNS = ["row_index", "kind", "camera", "src", "dst", "status", "error"]
 
-ROWS_COLUMNS = ("num", "start", "end", "trk", "status")
+ROWS_COLUMNS = ("num", "azs", "start", "end", "trk", "status")
 ROWS_HEADINGS = {
     "num": "№",
+    "azs": "АЗС",
     "start": "Начало",
     "end": "Конец",
     "trk": "ТРК",
     "status": "Статус",
 }
-ROWS_WIDTHS = {"num": 40, "start": 150, "end": 150, "trk": 110, "status": 240}
+ROWS_WIDTHS = {
+    "num": 40,
+    "azs": 55,
+    "start": 140,
+    "end": 140,
+    "trk": 110,
+    "status": 220,
+}
 
 RESULT_COLUMNS = ("row", "kind", "camera", "mtime", "src", "dst", "status")
 RESULT_HEADINGS = {
@@ -94,31 +111,6 @@ def format_minutes(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
     return f"{value:.2f}".rstrip("0").rstrip(".")
-
-
-@dataclass
-class ManualRow:
-    """Одна строка ручного задания."""
-
-    start: datetime
-    end: datetime
-    trks: List[int]
-    status: str = "ожидание"
-
-    @property
-    def start_text(self) -> str:
-        """Начало интервала в формате ввода."""
-        return self.start.strftime(DATETIME_FORMAT)
-
-    @property
-    def end_text(self) -> str:
-        """Конец интервала в формате ввода."""
-        return self.end.strftime(DATETIME_FORMAT)
-
-    @property
-    def trks_text(self) -> str:
-        """Список ТРК через запятую."""
-        return ",".join(str(trk) for trk in self.trks)
 
 
 class ManualTab(ttk.Frame):
@@ -212,7 +204,7 @@ class ManualTab(ttk.Frame):
         )
         for column in ROWS_COLUMNS:
             self.rows_tree.heading(column, text=ROWS_HEADINGS[column])
-            anchor = "center" if column in ("num", "trk") else "w"
+            anchor = "center" if column in ("num", "azs", "trk") else "w"
             self.rows_tree.column(column, width=ROWS_WIDTHS[column], anchor=anchor)
         self.rows_tree.tag_configure("error", foreground="#b00020")
         self.rows_tree.tag_configure("ok", foreground="#0a7d24")
@@ -231,6 +223,14 @@ class ManualTab(ttk.Frame):
         self.delete_button.pack(side="left")
         self.clear_button = ttk.Button(buttons, text="Очистить всё", command=self.on_clear_all)
         self.clear_button.pack(side="left", padx=6)
+        self.export_button = ttk.Button(
+            buttons, text="Экспорт в xlsx", command=self.on_export_xlsx
+        )
+        self.export_button.pack(side="left", padx=(12, 6))
+        self.import_button = ttk.Button(
+            buttons, text="Импорт из xlsx", command=self.on_import_xlsx
+        )
+        self.import_button.pack(side="left")
 
     def _build_run_panel(self) -> None:
         """Кнопки выполнения."""
@@ -458,11 +458,12 @@ class ManualTab(ttk.Frame):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _parse_datetime(text: str) -> Optional[datetime]:
-        """Разобрать дату-время формата ``YYYY-MM-DD HH:MM``."""
-        try:
-            return datetime.strptime(text, DATETIME_FORMAT)
-        except ValueError:
-            return None
+        """Разобрать дату-время формата ``YYYY-MM-DD HH:MM``.
+
+        Используется общий helper из :mod:`manual_xlsx`, чтобы форма и чтение
+        xlsx трактовали даты одинаково.
+        """
+        return parse_dt_text(text)
 
     def _parse_trks(self, text: str) -> Optional[List[int]]:
         """Разобрать список ТРК; пустое поле — все ТРК текущей АЗС."""
@@ -553,13 +554,16 @@ class ManualTab(ttk.Frame):
                 )
                 return
 
-        self.manual_rows.append(ManualRow(start=start, end=end, trks=trks))
+        self.manual_rows.append(
+            ManualRow(azscode=self.azs.number, start=start, end=end, trks=trks)
+        )
         self._refresh_rows_tree()
         self.start_var.set("")
         self.end_var.set("")
         self.status_var.set(f"Строк в списке: {len(self.manual_rows)}")
         LOGGER.info(
-            "Ручное копирование: добавлена строка %s..%s, ТРК %s",
+            "Ручное копирование: добавлена строка АЗС %s %s..%s, ТРК %s",
+            self.azs.number,
             start.strftime(DATETIME_FORMAT),
             end.strftime(DATETIME_FORMAT),
             ",".join(str(trk) for trk in trks),
@@ -603,7 +607,14 @@ class ManualTab(ttk.Frame):
 
     def _row_values(self, index: int, row: ManualRow) -> Tuple[object, ...]:
         """Значения колонок таблицы строк."""
-        return (index, row.start_text, row.end_text, row.trks_text, row.status)
+        return (
+            index,
+            "" if row.azscode is None else str(row.azscode),
+            row.start_text,
+            row.end_text,
+            row.trks_text,
+            row.status,
+        )
 
     @staticmethod
     def _row_tags(row: ManualRow) -> Tuple[str, ...]:
@@ -612,7 +623,7 @@ class ManualTab(ttk.Frame):
             return ("error",)
         if row.status.startswith("найдено") or row.status.startswith("скопировано"):
             return ("ok",)
-        if row.status == "пропущено":
+        if row.status.startswith("пропущено"):
             return ("warn",)
         return ()
 
@@ -635,6 +646,155 @@ class ManualTab(ttk.Frame):
         self.results_tree.delete(*self.results_tree.get_children())
 
     # ------------------------------------------------------------------ #
+    # Импорт/экспорт ручной таблицы в xlsx
+    # ------------------------------------------------------------------ #
+    def on_export_xlsx(self) -> None:
+        """Сохранить ручную таблицу в xlsx (колонки azscode/start/end/trk)."""
+        if self._is_busy():
+            messagebox.showwarning(
+                "Идёт обработка",
+                "Дождитесь завершения или нажмите «Остановить».",
+                parent=self,
+            )
+            return
+        if not self.manual_rows:
+            messagebox.showinfo("Экспорт в xlsx", "Нет строк для экспорта.", parent=self)
+            return
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path_text = filedialog.asksaveasfilename(
+            title="Экспорт ручной таблицы в xlsx",
+            initialdir=str(self.config.base_dir),
+            initialfile=f"manual_{stamp}.xlsx",
+            defaultextension=".xlsx",
+            filetypes=[("Файлы Excel", "*.xlsx"), ("Все файлы", "*.*")],
+            parent=self,
+        )
+        if not path_text:
+            return
+        path = Path(path_text)
+
+        try:
+            write_manual_xlsx(path, self.manual_rows, self.azs.number)
+        except Exception as exc:  # XlsxError/OSError — показываем пользователю
+            LOGGER.error("Ручное копирование: ошибка экспорта в %s: %s", path, exc)
+            messagebox.showerror(
+                "Экспорт в xlsx", f"Не удалось сохранить файл:\n{exc}", parent=self
+            )
+            return
+
+        LOGGER.info(
+            "Ручное копирование: экспортировано строк %s в %s",
+            len(self.manual_rows),
+            path,
+        )
+        messagebox.showinfo("Экспорт в xlsx", f"Сохранено: {path}", parent=self)
+        if messagebox.askyesno(
+            "Экспорт в xlsx", "Открыть папку с файлом?", parent=self
+        ):
+            self._open_directory(path.parent)
+
+    def on_import_xlsx(self) -> None:
+        """Выбрать xlsx и добавить строки из него в ручную таблицу."""
+        path_text = filedialog.askopenfilename(
+            title="Импорт ручной таблицы из xlsx",
+            initialdir=str(self.config.base_dir),
+            filetypes=[("Файлы Excel", "*.xlsx"), ("Все файлы", "*.*")],
+            parent=self,
+        )
+        if not path_text:
+            return
+        self.import_from_xlsx(Path(path_text))
+
+    def import_from_xlsx(self, path: Path) -> bool:
+        """Импортировать строки ручного xlsx, добавив их к текущим.
+
+        :param path: путь к xlsx
+        :return: ``True``, если файл распознан и строки добавлены
+        """
+        if self._is_busy():
+            messagebox.showwarning(
+                "Идёт обработка",
+                "Дождитесь завершения или нажмите «Остановить».",
+                parent=self,
+            )
+            return False
+        path = Path(path)
+        try:
+            kind = detect_xlsx_format(path)
+        except XlsxError as exc:
+            LOGGER.error("Ручное копирование: не удалось проверить %s: %s", path, exc)
+            messagebox.showerror("Импорт из xlsx", str(exc), parent=self)
+            return False
+
+        if kind == "jobs":
+            messagebox.showerror(
+                "Импорт из xlsx",
+                "Это файл заданий (docdate/azscode). Загрузите его на вкладке «Задания».",
+                parent=self,
+            )
+            return False
+        if kind != "manual":
+            messagebox.showerror(
+                "Импорт из xlsx",
+                "Не удалось распознать формат файла. "
+                "Ожидаются колонки azscode/start/end/trk.",
+                parent=self,
+            )
+            return False
+
+        try:
+            imported = read_manual_xlsx(path)
+        except XlsxError as exc:
+            LOGGER.error("Ручное копирование: ошибка импорта %s: %s", path, exc)
+            messagebox.showerror("Импорт из xlsx", str(exc), parent=self)
+            return False
+
+        for row in imported:
+            row.status = f"ошибка: {row.error}" if row.error else "ожидание"
+            self.manual_rows.append(row)
+
+        self._clear_results()
+        self._refresh_rows_tree()
+        foreign = sum(
+            1
+            for row in imported
+            if row.azscode is not None and row.azscode != self.azs.number
+        )
+        self.status_var.set(f"Импортировано строк: {len(imported)}")
+        LOGGER.info(
+            "Ручное копирование: импортировано строк %s из %s (для других АЗС: %s)",
+            len(imported),
+            path,
+            foreign,
+        )
+
+        if foreign:
+            messagebox.showinfo(
+                "Импорт из xlsx",
+                f"Импортировано {len(imported)} строк. Из них {foreign} строк для "
+                "других АЗС — они будут пропущены при копировании.",
+                parent=self,
+            )
+        else:
+            messagebox.showinfo(
+                "Импорт из xlsx",
+                f"Импортировано {len(imported)} строк.",
+                parent=self,
+            )
+        return True
+
+    def _open_directory(self, path: Path) -> None:
+        """Открыть каталог в Проводнике."""
+        try:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        except OSError as exc:
+            messagebox.showerror(
+                "Ошибка", f"Не удалось открыть {path}: {exc}", parent=self
+            )
+
+    # ------------------------------------------------------------------ #
     # Запуск поиска/копирования
     # ------------------------------------------------------------------ #
     def on_find_all(self) -> None:
@@ -654,14 +814,7 @@ class ManualTab(ttk.Frame):
 
     def on_open_output(self) -> None:
         """Открыть ``output_root`` текущей АЗС в Проводнике."""
-        target = Path(self.azs.output_root)
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-            os.startfile(str(target))  # type: ignore[attr-defined]
-        except OSError as exc:
-            messagebox.showerror(
-                "Ошибка", f"Не удалось открыть {target}: {exc}", parent=self
-            )
+        self._open_directory(Path(self.azs.output_root))
 
     def _is_busy(self) -> bool:
         """Идёт ли сейчас фоновая обработка."""
@@ -682,7 +835,12 @@ class ManualTab(ttk.Frame):
         self._load_clock_from_config()
         self._clear_results()
         for row in self.manual_rows:
-            row.status = "ожидание"
+            if row.error:
+                row.status = f"ошибка: {row.error}"
+            elif row.azscode is not None and row.azscode != self.azs.number:
+                row.status = "пропущено (другая АЗС)"
+            else:
+                row.status = "ожидание"
         self._refresh_rows_tree()
         self.refresh_expiry_state()
 
@@ -717,13 +875,23 @@ class ManualTab(ttk.Frame):
         finder_cfg = replace(config.finder, clock_drift_minutes=drift)
 
         rows = list(self.manual_rows)
+
+        def resolved_trks(row: ManualRow) -> List[int]:
+            """ТРК строки; пустой список = все ТРК текущей АЗС."""
+            return row.trks or sorted(azs.trk_map.keys())
+
         for row in rows:
-            row.status = "ожидание"
+            if row.error:
+                row.status = f"ошибка: {row.error}"
+            elif row.azscode is not None and row.azscode != azs.number:
+                row.status = "пропущено (другая АЗС)"
+            else:
+                row.status = "ожидание"
         self._refresh_rows_tree()
         self._clear_results()
 
         self._stop_event.clear()
-        total_cells = max(1, sum(len(row.trks) for row in rows))
+        total_cells = max(1, sum(len(resolved_trks(row)) for row in rows))
         self.progress.configure(maximum=total_cells, value=0)
         mode_text = "Поиск" if scan_only else "Копирование"
         self.status_var.set(f"{mode_text}: 0 из {total_cells}")
@@ -758,10 +926,22 @@ class ManualTab(ttk.Frame):
                         emit("row_status", (rest, "пропущено"))
                     break
 
+                if row.error:
+                    emit("row_status", (position, f"ошибка: {row.error}"))
+                    done_cells += max(1, len(resolved_trks(row)))
+                    emit("progress", (done_cells, total_cells))
+                    continue
+
+                if row.azscode is not None and row.azscode != azs.number:
+                    emit("row_status", (position, "пропущено (другая АЗС)"))
+                    done_cells += max(1, len(resolved_trks(row)))
+                    emit("progress", (done_cells, total_cells))
+                    continue
+
                 row_found = 0
                 row_records: List[CopyRecord] = []
 
-                for trk in row.trks:
+                for trk in resolved_trks(row):
                     if self._stop_event.is_set():
                         break
                     cameras = azs.cameras_for_trk(trk)
@@ -884,6 +1064,8 @@ class ManualTab(ttk.Frame):
             self.add_button,
             self.delete_button,
             self.clear_button,
+            self.export_button,
+            self.import_button,
             self.save_clock_button,
         ):
             widget.configure(state=state)

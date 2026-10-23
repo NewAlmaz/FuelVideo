@@ -42,6 +42,7 @@ from copier import (
     write_reports,
 )
 from manual_tab import ManualTab, format_minutes
+from manual_xlsx import detect_xlsx_format
 from video_finder import FoundFile
 from xlsx_reader import RowData, XlsxError, read_rows
 
@@ -578,7 +579,45 @@ class ExporterApp(ttk.Frame):
         self.load_xlsx(Path(path_text))
 
     def load_xlsx(self, path: Path) -> None:
-        """Прочитать xlsx и заполнить таблицу строк."""
+        """Прочитать xlsx и заполнить таблицу строк.
+
+        Единая точка входа для кнопки «Выбрать xlsx» и запуска с ``--xlsx``.
+        Сначала определяется формат файла: файл ручного копирования
+        (колонки ``azscode/start/end/trk``) здесь не читается — предлагается
+        перейти на вкладку «Ручное копирование».
+        """
+        path = Path(path)
+        try:
+            kind = detect_xlsx_format(path)
+        except XlsxError as exc:
+            LOGGER.error("Не удалось определить формат xlsx: %s", exc)
+            messagebox.showerror("Ошибка чтения xlsx", str(exc), parent=self)
+            return
+
+        if kind == "manual":
+            messagebox.showwarning(
+                "Файл ручного копирования",
+                "Это файл ручного копирования (колонки start/end/trk). "
+                "Его нужно загружать на вкладке «Ручное копирование».",
+                parent=self,
+            )
+            if messagebox.askyesno(
+                "Перейти на вкладку?",
+                "Перейти на вкладку «Ручное копирование» и загрузить файл туда?",
+                parent=self,
+            ):
+                self.notebook.select(self.manual_tab)
+                self.manual_tab.import_from_xlsx(path)
+            return
+
+        if kind != "jobs":
+            messagebox.showerror(
+                "Ошибка чтения xlsx",
+                "Не удалось распознать формат файла.",
+                parent=self,
+            )
+            return
+
         try:
             rows = read_rows(path)
         except XlsxError as exc:
