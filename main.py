@@ -135,11 +135,17 @@ def run_selftest(config: AppConfig, xlsx_path: Optional[Path]) -> int:
     """
     print("=== FuelVideo: самотестирование ===")
     print()
+    rollback, saved_date = expiry.check_clock_rollback()
     print(f"Срок действия: {expiry.expiry_text()}", end="")
     if expiry.is_expired():
-        print(" (ИСТЁК, копирование заблокировано)")
+        print(" (ИСТЁК)")
     else:
         print()
+    if rollback:
+        if saved_date is not None:
+            print(f"Обнаружен откат часов: до отката была дата {saved_date:%d.%m.%Y}")
+        else:
+            print("Обнаружен откат часов.")
     print()
 
     parsed_current = parse_current_azs(config.general.current_azs)
@@ -357,21 +363,16 @@ def run_gui(config: AppConfig, ui_queue: "queue.Queue[str]", xlsx_path: Optional
 
     root = tk.Tk()
     root.withdraw()  # прячем ГЛАВНОЕ окно, пока выбираем АЗС
-    clock_rollback = expiry.check_clock_rollback()
-    if expiry.is_expired():
-        LOGGER.warning(
-            "expiry: %s, expired=%s, clock_rollback=%s",
-            expiry.expiry_text(),
-            True,
-            clock_rollback,
-        )
-    else:
-        LOGGER.info(
-            "expiry: %s, expired=%s, clock_rollback=%s",
-            expiry.expiry_text(),
-            False,
-            clock_rollback,
-        )
+    clock_rollback, saved_date = expiry.check_clock_rollback()
+    expired = expiry.is_expired()
+    log_expiry = LOGGER.warning if expired else LOGGER.info
+    log_expiry(
+        "expiry: %s, expired=%s, clock_rollback=%s (saved=%s)",
+        expiry.expiry_text(),
+        expired,
+        clock_rollback,
+        saved_date,
+    )
     log_path = gui._startup_debug_path()
     gui.log_startup(
         f"startup: app launch, current_azs={config.general.current_azs!r}, "

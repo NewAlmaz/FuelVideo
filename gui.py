@@ -18,7 +18,7 @@ import queue
 import threading
 import tkinter as tk
 import traceback
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -29,6 +29,8 @@ from expiry import (
     check_clock_rollback,
     expiry_text,
     is_expired,
+    rollback_message,
+    should_block,
     verify_unlock_password,
 )
 from license import UNLOCK_PASSWORD_HASH
@@ -406,6 +408,8 @@ class ExporterApp(ttk.Frame):
         # разблокировка живёт только до конца текущей сессии.
         self._unlocked: bool = False
         self._clock_rollback: bool = False
+        self._saved_date: Optional[date] = None
+        self._rollback_notified: bool = False
 
         APP_VERSION = "0.1.0"
         self.root.title(f"FuelVideo — копирование видео и звука из СВН «Интеллект» v{APP_VERSION}")
@@ -628,14 +632,25 @@ class ExporterApp(ttk.Frame):
     def _expiry_allows(self) -> bool:
         """Разрешено ли действие мягким предохранителем срока действия.
 
+        Перепроверяет даты и откат часов непосредственно перед запуском задачи.
+
         :return: ``True``, если работа разрешена; иначе показывает окно и
             возвращает ``False``
         """
-        if (is_expired() or self._clock_rollback) and not self._unlocked:
+        rollback, saved_date = check_clock_rollback()
+        self._clock_rollback = rollback
+        self._saved_date = saved_date
+        if should_block(rollback, saved_date) and not self._unlocked:
+            if is_expired():
+                text = (
+                    f"Срок действия программы истёк ({expiry_text()}). "
+                    "Копирование заблокировано."
+                )
+            else:
+                text = "Обнаружен откат системных часов. Копирование заблокировано."
             messagebox.showwarning(
                 "Срок истёк",
-                f"Срок действия программы истёк ({expiry_text()}). "
-                "Копирование заблокировано.\nВведите код разблокировки.",
+                f"{text}\nВведите код разблокировки.",
                 parent=self,
             )
             return False
@@ -826,14 +841,17 @@ class ExporterApp(ttk.Frame):
         """Идёт ли сейчас фоновая обработка."""
         return self._worker is not None and self._worker.is_alive()
 
+    def _expiry_blocked(self) -> bool:
+        """Заблокирована ли работа мягким предохранителем прямо сейчас."""
+        return should_block(self._clock_rollback, self._saved_date) and not self._unlocked
+
     def _set_buttons_enabled(self, enabled: bool) -> None:
         """Заблокировать/разблокировать кнопки запуска.
 
         Блокировка по сроку действия имеет приоритет: после завершения задачи
         кнопки не включаются, если предохранитель сработал.
         """
-        expiry_blocked = (is_expired() or self._clock_rollback) and not self._unlocked
-        state = "normal" if enabled and not expiry_blocked else "disabled"
+        state = "normal" if enabled and not self._expiry_blocked() else "disabled"
         self.scan_button.configure(state=state)
         self.copy_button.configure(state=state)
 
@@ -843,38 +861,81 @@ class ExporterApp(ttk.Frame):
     def _apply_expiry_state(self) -> None:
         """Применить состояние предохранителя к кнопкам и строке статуса.
 
-        Срок проверяется здесь же (часы могли откатить между запусками),
+        Даты проверяются здесь же (часы могли откатить между запусками),
         поэтому метод вызывается и при старте, и после разблокировки.
+
+        Откат часов сам по себе не блокирует: блокировка включается только если
+        реальный срок вышел или до отката дата уже была после ``EXPIRY_DATE``.
         """
-        self._clock_rollback = check_clock_rollback()
-        expired = is_expired() or self._clock_rollback
-        blocked = expired and not self._unlocked
+        rollback, saved_date = check_clock_rollback()
+        self._clock_rollback = rollback
+        self._saved_date = saved_date
+        blocked = should_block(rollback, saved_date) and not self._unlocked
 
         if blocked:
             self.copy_button.configure(state="disabled")
             self.scan_button.configure(state="disabled")
             self.unlock_button.configure(state="normal")
-            if self._clock_rollback:
-                self.status_var.set(
-                    "Обнаружен откат системных часов. Копирование заблокировано. "
-                    "Введите код разблокировки."
-                )
-            else:
+            if is_expired():
                 self.status_var.set(
                     f"Срок действия истёк ({expiry_text()}). Копирование заблокировано."
                 )
+            else:
+                self.status_var.set(
+                    "Обнаружен откат системных часов. Копирование заблокировано."
+                )
             LOGGER.warning(
-                "expiry: блокировка (expired=%s, clock_rollback=%s)",
+                "expiry: блокировка (expired=%s, clock_rollback=%s, saved=%s)",
                 is_expired(),
-                self._clock_rollback,
+                rollback,
+                saved_date,
             )
         else:
             self.copy_button.configure(state="normal")
             self.scan_button.configure(state="normal")
             self.unlock_button.configure(state="disabled")
-            if self._unlocked:
+            if rollback:
+                self.status_var.set(
+                    rollback_message(rollback, saved_date) + " Работа продолжается."
+                )
+            elif self._unlocked:
                 self.status_var.set("Разблокировано до конца сессии")
-            LOGGER.info("expiry: активен %s, clock_rollback=False", expiry_text())
+            else:
+                self.status_var.set("Готов к работе")
+            LOGGER.info(
+                "expiry: активен %s, clock_rollback=%s, saved=%s",
+                expiry_text(),
+                rollback,
+                saved_date,
+            )
+
+        # Предупреждение об откате часов — один раз за запуск (не при смене АЗС).
+        if rollback and not self._rollback_notified:
+            self._rollback_notified = True
+            self.root.after(
+                300, lambda: self._notify_rollback(blocked, rollback, saved_date)
+            )
+
+    def _notify_rollback(
+        self, blocked: bool, rollback: bool, saved_date: Optional[date]
+    ) -> None:
+        """Показать пользователю предупреждение об обнаруженном откате часов."""
+        message = rollback_message(rollback, saved_date)
+        try:
+            if blocked:
+                messagebox.showwarning(
+                    "Откат часов",
+                    message + "\nКопирование заблокировано.",
+                    parent=self,
+                )
+            else:
+                messagebox.showinfo(
+                    "Откат часов",
+                    message + "\nРабота продолжается, но проверьте дату на компьютере.",
+                    parent=self,
+                )
+        except tk.TclError as exc:  # сообщение не должно ломать главное окно
+            LOGGER.error("Не удалось показать предупреждение об откате часов: %s", exc)
 
     def on_unlock(self) -> None:
         """Запросить код разблокировки (модальный диалог)."""
