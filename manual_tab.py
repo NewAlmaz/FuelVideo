@@ -745,186 +745,233 @@ class ManualTab(ttk.Frame):
         self._refresh_rows_tree()
         self._clear_results()
 
-        self._stop_event.clear()
-        total_cells = max(1, sum(len(resolved_trks(row)) for row in rows))
-        self.progress.configure(maximum=total_cells, value=0)
-        mode_text = "Поиск" if scan_only else "Копирование"
-        self.status_var.set(f"{mode_text}: 0 из {total_cells}")
-        LOGGER.info(
-            "Ручное копирование (%s): АЗС %s, строк %s, output_root=%s, сдвиг %s мин",
-            mode_text,
-            azs.number,
-            len(rows),
-            azs.output_root,
-            format_minutes(drift),
-        )
-        self._set_busy(True)
+        try:
+            self._stop_event.clear()
+            total_cells = max(1, sum(len(resolved_trks(row)) for row in rows))
+            self.progress.configure(maximum=total_cells, value=0)
+            mode_text = "Поиск" if scan_only else "Копирование"
+            self.status_var.set(f"{mode_text}: 0 из {total_cells}")
+            LOGGER.info(
+                "Ручное копирование (%s): АЗС %s, строк %s, output_root=%s, сдвиг %s мин",
+                mode_text,
+                azs.number,
+                len(rows),
+                azs.output_root,
+                format_minutes(drift),
+            )
+            LOGGER.info(
+                "manual: before set_busy, rows=%s, trks_total=%s",
+                len(rows),
+                total_cells,
+            )
+            self._set_busy(True)
+            LOGGER.info("manual: set_busy done, starting worker thread")
 
-        def emit(kind: str, payload: object) -> None:
-            self._event_queue.put((kind, payload))
+            def emit(kind: str, payload: object) -> None:
+                self._event_queue.put((kind, payload))
 
-        def run() -> Dict[str, object]:
-            video_roots = drives.resolve_video_roots(config, azs)
-            include_audio = config.general.include_audio
-            done_cells = 0
-            total_found = 0
-            total_copied = 0
-            total_already = 0
-            total_overwritten = 0
-            total_errors = 0
-            all_records: List[CopyRecord] = []
+            def run() -> Dict[str, object]:
+                LOGGER.info(
+                    "manual: run() entered, rows=%s, scan_only=%s",
+                    len(rows),
+                    scan_only,
+                )
+                video_roots = drives.resolve_video_roots(config, azs)
+                include_audio = config.general.include_audio
+                done_cells = 0
+                total_found = 0
+                total_copied = 0
+                total_already = 0
+                total_overwritten = 0
+                total_errors = 0
+                all_records: List[CopyRecord] = []
 
-            for position, row in enumerate(rows, start=1):
-                if self._stop_event.is_set():
-                    for rest in range(position, len(rows) + 1):
-                        emit("row_status", (rest, "пропущено"))
-                    break
-
-                if row.error:
-                    emit("row_status", (position, f"ошибка: {row.error}"))
-                    done_cells += max(1, len(resolved_trks(row)))
-                    emit("progress", (done_cells, total_cells))
-                    continue
-
-                if row.azscode is not None and row.azscode != azs.number:
-                    emit("row_status", (position, "пропущено (другая АЗС)"))
-                    done_cells += max(1, len(resolved_trks(row)))
-                    emit("progress", (done_cells, total_cells))
-                    continue
-
-                row_found = 0
-                row_records: List[CopyRecord] = []
-
-                for trk in resolved_trks(row):
+                for position, row in enumerate(rows, start=1):
                     if self._stop_event.is_set():
+                        for rest in range(position, len(rows) + 1):
+                            emit("row_status", (rest, "пропущено"))
                         break
-                    cameras = azs.cameras_for_trk(trk)
-                    if not cameras:
+
+                    if row.error:
+                        emit("row_status", (position, f"ошибка: {row.error}"))
+                        done_cells += max(1, len(resolved_trks(row)))
+                        emit("progress", (done_cells, total_cells))
                         continue
 
-                    files: List[FoundFile] = list(
-                        find_files_for_cameras(
-                            azs=azs,
-                            cameras=cameras,
-                            start=row.start,
-                            end=row.end,
-                            finder_cfg=finder_cfg,
-                            video_roots=video_roots,
-                            include_audio=include_audio,
-                        )
-                    )
-                    row_found += len(files)
-                    total_found += len(files)
+                    if row.azscode is not None and row.azscode != azs.number:
+                        emit("row_status", (position, "пропущено (другая АЗС)"))
+                        done_cells += max(1, len(resolved_trks(row)))
+                        emit("progress", (done_cells, total_cells))
+                        continue
 
-                    if files and scan_only:
-                        for item in files:
-                            record = CopyRecord(
-                                row_index=position,
-                                azs=azs.number,
-                                docdate=row.start,
-                                trk=trk,
-                                camera=item.camera,
-                                kind=item.kind,
-                                src=item.src,
-                                dst=destination_for(
-                                    item.src, item.video_root, azs.output_root
-                                ),
-                                status=STATUS_WILL_COPY,
+                    row_found = 0
+                    row_records: List[CopyRecord] = []
+
+                    for trk in resolved_trks(row):
+                        if self._stop_event.is_set():
+                            break
+                        cameras = azs.cameras_for_trk(trk)
+                        if not cameras:
+                            continue
+
+                        files: List[FoundFile] = list(
+                            find_files_for_cameras(
+                                azs=azs,
+                                cameras=cameras,
+                                start=row.start,
+                                end=row.end,
+                                finder_cfg=finder_cfg,
+                                video_roots=video_roots,
+                                include_audio=include_audio,
                             )
-                            row_records.append(record)
-                            all_records.append(record)
-                            emit("record", (record, item.mtime_text))
-                    elif files:
-                        mtime_by_src = {
-                            str(item.src).lower(): item.mtime_text for item in files
-                        }
-
-                        def on_file(record: CopyRecord, mapping: Dict[str, str] = mtime_by_src) -> None:
-                            key = str(record.src).lower() if record.src else ""
-                            emit("record", (record, mapping.get(key, "—")))
-
-                        copied = copy_found_files(
-                            files=files,
-                            azs=azs,
-                            general_cfg=config.general,
-                            stop_event=self._stop_event,
-                            on_file=on_file,
-                            row_index=position,
-                            trk=trk,
-                            docdate=row.start,
                         )
-                        row_records.extend(copied)
-                        all_records.extend(copied)
+                        row_found += len(files)
+                        total_found += len(files)
 
-                    done_cells += 1
-                    emit("progress", (done_cells, total_cells))
+                        if files and scan_only:
+                            for item in files:
+                                record = CopyRecord(
+                                    row_index=position,
+                                    azs=azs.number,
+                                    docdate=row.start,
+                                    trk=trk,
+                                    camera=item.camera,
+                                    kind=item.kind,
+                                    src=item.src,
+                                    dst=destination_for(
+                                        item.src, item.video_root, azs.output_root
+                                    ),
+                                    status=STATUS_WILL_COPY,
+                                )
+                                row_records.append(record)
+                                all_records.append(record)
+                                emit("record", (record, item.mtime_text))
+                        elif files:
+                            mtime_by_src = {
+                                str(item.src).lower(): item.mtime_text for item in files
+                            }
 
-                if scan_only:
-                    status_text = f"найдено {row_found}" if row_found else "пропущено"
-                else:
-                    copied_n = sum(1 for rec in row_records if rec.status == STATUS_COPIED)
-                    overwritten_n = sum(
-                        1 for rec in row_records if rec.status == STATUS_SIZE_MISMATCH
-                    )
-                    already_n = sum(
-                        1 for rec in row_records if rec.status == STATUS_ALREADY_EXISTS
-                    )
-                    errors_n = sum(1 for rec in row_records if rec.status == STATUS_ERROR)
-                    total_copied += copied_n
-                    total_overwritten += overwritten_n
-                    total_already += already_n
-                    total_errors += errors_n
-                    if errors_n:
-                        status_text = "ошибка"
-                    elif copied_n or overwritten_n or already_n:
-                        status_text = f"скопировано {copied_n + overwritten_n + already_n}"
+                            def on_file(
+                                record: CopyRecord,
+                                mapping: Dict[str, str] = mtime_by_src,
+                            ) -> None:
+                                key = str(record.src).lower() if record.src else ""
+                                emit("record", (record, mapping.get(key, "—")))
+
+                            copied = copy_found_files(
+                                files=files,
+                                azs=azs,
+                                general_cfg=config.general,
+                                stop_event=self._stop_event,
+                                on_file=on_file,
+                                row_index=position,
+                                trk=trk,
+                                docdate=row.start,
+                            )
+                            row_records.extend(copied)
+                            all_records.extend(copied)
+
+                        done_cells += 1
+                        emit("progress", (done_cells, total_cells))
+
+                    if scan_only:
+                        status_text = (
+                            f"найдено {row_found}" if row_found else "пропущено"
+                        )
                     else:
-                        status_text = "пропущено"
-                emit("row_status", (position, status_text))
+                        copied_n = sum(
+                            1 for rec in row_records if rec.status == STATUS_COPIED
+                        )
+                        overwritten_n = sum(
+                            1
+                            for rec in row_records
+                            if rec.status == STATUS_SIZE_MISMATCH
+                        )
+                        already_n = sum(
+                            1
+                            for rec in row_records
+                            if rec.status == STATUS_ALREADY_EXISTS
+                        )
+                        errors_n = sum(
+                            1 for rec in row_records if rec.status == STATUS_ERROR
+                        )
+                        total_copied += copied_n
+                        total_overwritten += overwritten_n
+                        total_already += already_n
+                        total_errors += errors_n
+                        if errors_n:
+                            status_text = "ошибка"
+                        elif copied_n or overwritten_n or already_n:
+                            status_text = (
+                                f"скопировано {copied_n + overwritten_n + already_n}"
+                            )
+                        else:
+                            status_text = "пропущено"
+                    emit("row_status", (position, status_text))
 
-            report_path: Optional[Path] = None
-            if all_records:
-                report_path = self._write_report(azs.output_root, all_records)
+                report_path: Optional[Path] = None
+                if all_records:
+                    report_path = self._write_report(azs.output_root, all_records)
 
-            return {
-                "scan_only": scan_only,
-                "rows": len(rows),
-                "found": total_found,
-                "copied": total_copied,
-                "already": total_already,
-                "overwritten": total_overwritten,
-                "errors": total_errors,
-                "report": report_path,
-                "stopped": self._stop_event.is_set(),
-            }
+                LOGGER.info(
+                    "manual: run() finished, found=%s, copied=%s, errors=%s",
+                    total_found,
+                    total_copied,
+                    total_errors,
+                )
+                return {
+                    "scan_only": scan_only,
+                    "rows": len(rows),
+                    "found": total_found,
+                    "copied": total_copied,
+                    "already": total_already,
+                    "overwritten": total_overwritten,
+                    "errors": total_errors,
+                    "report": report_path,
+                    "stopped": self._stop_event.is_set(),
+                }
 
-        def worker() -> None:
-            try:
-                self._event_queue.put(("done", run()))
-            except Exception as exc:  # защита от падения фонового потока
-                LOGGER.exception("Ручное копирование: ошибка выполнения: %s", exc)
-                self._event_queue.put(("error", str(exc)))
+            def worker() -> None:
+                LOGGER.info(
+                    "manual: worker thread started, name=%s",
+                    threading.current_thread().name,
+                )
+                try:
+                    self._event_queue.put(("done", run()))
+                except Exception as exc:  # защита от падения фонового потока
+                    LOGGER.exception(
+                        "Ручное копирование: ошибка выполнения: %s", exc
+                    )
+                    self._event_queue.put(("error", str(exc)))
 
-        self._worker = threading.Thread(
-            target=worker, name="FuelVideoManualWorker", daemon=True
-        )
-        self._worker.start()
+            self._worker = threading.Thread(
+                target=worker, name="FuelVideoManualWorker", daemon=True
+            )
+            self._worker.start()
+        except Exception as exc:
+            LOGGER.exception("manual: ошибка запуска задачи: %s", exc)
+            self._set_busy(False)
+            self.status_var.set("Ошибка запуска — см. лог")
+            messagebox.showerror("Ошибка запуска", str(exc), parent=self)
+            return
 
     def _set_busy(self, busy: bool) -> None:
         """Заблокировать элементы управления на время выполнения."""
-        self._busy = busy
-        state = "disabled" if busy else "normal"
-        for widget in (
-            self.add_button,
-            self.delete_button,
-            self.clear_button,
-            self.export_button,
-            self.import_button,
-            self.save_clock_button,
-        ):
-            widget.configure(state=state)
-        self.stop_button.configure(state="normal" if busy else "disabled")
-        self.refresh_expiry_state()
+        try:
+            self._busy = busy
+            state = "disabled" if busy else "normal"
+            for widget in (
+                self.add_button,
+                self.delete_button,
+                self.clear_button,
+                self.export_button,
+                self.import_button,
+            ):
+                widget.configure(state=state)
+            self.stop_button.configure(state="normal" if busy else "disabled")
+            self.refresh_expiry_state()
+        except Exception as exc:
+            LOGGER.exception("manual: ошибка в _set_busy: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Отчёт CSV
