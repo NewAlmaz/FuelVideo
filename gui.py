@@ -12,12 +12,15 @@
 
 from __future__ import annotations
 
+import configparser
 import logging
 import os
 import queue
+import re
 import threading
 import tkinter as tk
 import traceback
+import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -33,7 +36,7 @@ from expiry import (
     should_block,
     verify_unlock_password,
 )
-from license import UNLOCK_PASSWORD_HASH
+from license import BUILD_DATE, UNLOCK_PASSWORD_HASH
 from copier import (
     JobRunner,
     RowResult,
@@ -41,12 +44,22 @@ from copier import (
     status_label,
     write_reports,
 )
-from manual_tab import ManualTab, format_minutes
+from manual_tab import ManualTab, clock_drift_text, format_minutes
 from manual_xlsx import detect_xlsx_format
 from video_finder import FoundFile
 from xlsx_reader import RowData, XlsxError, read_rows
 
 LOGGER = logging.getLogger(__name__)
+
+#: Версия приложения (заголовок окна и «О программе»).
+APP_VERSION = "1.0.0"
+
+#: Сведения для окна «О программе» (кроме версии и даты сборки).
+ABOUT_TITLE = "FuelVideo"
+ABOUT_PURPOSE = "копирование видео и звука из СВН «Интеллект» по данным о заправках"
+ABOUT_AUTHOR = "Пчёлко Алексей Львович"
+ABOUT_ORGANIZATION = "РУП «Белоруснефть-Гроднооблнефтепродукт», г. Сморгонь"
+ABOUT_SOURCE_URL = "https://github.com/NewAlmaz/FuelVideo"
 
 TASKS_COLUMNS = ("azs", "docdate", "trk", "cameras", "start", "end", "video", "audio", "status")
 TASKS_HEADINGS = {
@@ -132,6 +145,64 @@ def _reset_topmost(window: tk.Misc) -> None:
         pass
 
 
+def _open_url(url: str) -> None:
+    """Открыть ссылку в браузере по умолчанию."""
+    try:
+        webbrowser.open(url)
+    except Exception as exc:  # браузер не должен ломать окно
+        LOGGER.error("Не удалось открыть ссылку %s: %s", url, exc)
+
+
+def show_about_dialog(parent: tk.Misc, version: str, build_date: str) -> None:
+    """Показать модальное окно «О программе».
+
+    :param parent: главное окно приложения
+    :param version: версия программы (``APP_VERSION``)
+    :param build_date: дата сборки (``license.BUILD_DATE``)
+    """
+    dlg = tk.Toplevel(parent)
+    dlg.title("О программе")
+    # transient только для видимого родителя — иначе окно не мапится (см. ask_azs_dialog).
+    if parent.winfo_viewable():
+        dlg.transient(parent)
+    dlg.resizable(False, False)
+
+    frame = ttk.Frame(dlg, padding=14)
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(frame, text=ABOUT_TITLE, font=("Segoe UI", 14, "bold")).grid(
+        row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
+    )
+
+    rows = (
+        ("Версия", version),
+        ("Дата сборки", build_date),
+        ("Назначение", ABOUT_PURPOSE),
+        ("Автор", ABOUT_AUTHOR),
+        ("Организация", ABOUT_ORGANIZATION),
+        ("Исходный код", ABOUT_SOURCE_URL),
+    )
+    for offset, (title, value) in enumerate(rows, start=1):
+        ttk.Label(frame, text=f"{title}:", font=("Segoe UI", 9, "bold")).grid(
+            row=offset, column=0, sticky="nw", padx=(0, 8), pady=1
+        )
+        label = ttk.Label(frame, text=value, justify="left", wraplength=430)
+        label.grid(row=offset, column=1, sticky="w", pady=1)
+        if value.startswith("http"):
+            label.configure(cursor="hand2", foreground="#0a4d9c")
+            label.bind("<Button-1>", lambda _event, url=value: _open_url(url))
+
+    buttons = ttk.Frame(frame)
+    buttons.grid(row=len(rows) + 1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+    ttk.Button(buttons, text="Закрыть", command=dlg.destroy).pack(side="right")
+
+    dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+    dlg.bind("<Escape>", lambda _event: dlg.destroy())
+    dlg.update_idletasks()
+    dlg.grab_set()
+    dlg.wait_window()
+
+
 def ask_azs_dialog(parent: tk.Misc, options: Sequence[Tuple[int, str]]) -> Optional[int]:
     """Показать модальный диалог выбора АЗС.
 
@@ -202,8 +273,9 @@ def ask_azs_dialog(parent: tk.Misc, options: Sequence[Tuple[int, str]]) -> Optio
             log_startup("dialog: closed by window manager")
             dlg.destroy()
 
-        ttk.Button(buttons, text="Выбрать", command=on_ok).pack(side="right")
-        ttk.Button(buttons, text="Выход", command=on_cancel).pack(side="right", padx=(0, 8))
+        # «Выбрать» — слева, «Выход» — справа (Enter/Escape работают как раньше).
+        ttk.Button(buttons, text="Выбрать", command=on_ok).pack(side="left")
+        ttk.Button(buttons, text="Выход", command=on_cancel).pack(side="right")
 
         dlg.protocol("WM_DELETE_WINDOW", on_window_close)
         dlg.bind("<Return>", on_ok)
@@ -413,14 +485,21 @@ class ExporterApp(ttk.Frame):
         self._saved_date: Optional[date] = None
         self._rollback_notified: bool = False
 
-        APP_VERSION = "1.0.0"
-        self.root.title(f"FuelVideo — копирование видео и звука из СВН «Интеллект» v{APP_VERSION}")
+        # Сдвиг часов видео-сервера (секция [finder] на вкладке «Настройки»).
+        self.clock_mode_var = tk.StringVar(value="none")
+        self.clock_minutes_var = tk.StringVar(value="0")
+        self.clock_label_var = tk.StringVar(value="Сдвиг часов: —")
+
+        self.root.title(
+            f"FuelVideo — копирование видео и звука из СВН «Интеллект» v{APP_VERSION}"
+        )
         self.root.geometry("1200x720")
         self.root.minsize(980, 600)
 
         self._build_ui()
         self.pack(fill="both", expand=True)
         self._update_azs_label()
+        self._load_clock_from_config()
         # Заполнение вкладки «Настройки» обращается к дискам (в т.ч. сетевым),
         # поэтому выполняем его уже после того, как окно покажется на экране.
         self.root.after(100, self._rebuild_settings)
@@ -461,9 +540,19 @@ class ExporterApp(ttk.Frame):
         top = ttk.Frame(self.tasks_tab)
         top.pack(fill="x", pady=(0, 6))
 
+        # Маленькая «ⓘ» в правом верхнем углу вкладки — окно «О программе».
+        ttk.Button(top, text="ⓘ", width=3, command=self.on_about).pack(side="right")
+
         self.azs_var = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.azs_var, font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Button(top, text="Сменить АЗС", command=self.on_switch_azs).pack(side="left", padx=6)
+
+        # Read-only сдвиг часов; редактируется на вкладке «Настройки».
+        ttk.Label(top, textvariable=self.clock_label_var).pack(side="left", padx=(6, 4))
+        ttk.Button(top, text="Изменить", command=self.on_edit_clock).pack(
+            side="left", padx=(0, 6)
+        )
+
         self.unlock_button = ttk.Button(
             top,
             text="Ввести код разблокировки",
@@ -538,6 +627,13 @@ class ExporterApp(ttk.Frame):
         )
         ttk.Button(buttons, text="Открыть azs.ini", command=self.on_open_azs_ini).pack(side="left")
 
+        self._build_clock_panel()
+
+        # Кнопка «О программе» — в самом низу вкладки «Настройки».
+        about_frame = ttk.Frame(self.settings_tab)
+        about_frame.pack(side="bottom", fill="x", pady=(6, 0))
+        ttk.Button(about_frame, text="О программе", command=self.on_about).pack(side="left")
+
         text_frame = ttk.Frame(self.settings_tab)
         text_frame.pack(fill="both", expand=True)
         self.settings_text = tk.Text(text_frame, wrap="word", state="disabled")
@@ -562,6 +658,225 @@ class ExporterApp(ttk.Frame):
         self.log_text.configure(yscrollcommand=log_vsb.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         log_vsb.pack(side="right", fill="y")
+
+    # ------------------------------------------------------------------ #
+    # Сдвиг часов видео-сервера (секция «Параметры поиска ([finder])»)
+    # ------------------------------------------------------------------ #
+    def _build_clock_panel(self) -> None:
+        """Блок «без сдвига / отстают на / спешат на» + минуты + «Сохранить»."""
+        frame = ttk.LabelFrame(
+            self.settings_tab,
+            text="Параметры поиска ([finder]) — сдвиг часов видео-сервера",
+            padding=6,
+        )
+        frame.pack(fill="x", pady=(0, 6))
+
+        ttk.Label(frame, text="Сдвиг часов:").pack(side="left")
+
+        self.clock_none_radio = ttk.Radiobutton(
+            frame,
+            text="Без сдвига",
+            value="none",
+            variable=self.clock_mode_var,
+            command=self._update_clock_entry_state,
+        )
+        self.clock_none_radio.pack(side="left", padx=(12, 0))
+
+        self.clock_behind_radio = ttk.Radiobutton(
+            frame,
+            text="Часы отстают на",
+            value="behind",
+            variable=self.clock_mode_var,
+            command=self._update_clock_entry_state,
+        )
+        self.clock_behind_radio.pack(side="left", padx=(12, 0))
+
+        self.clock_ahead_radio = ttk.Radiobutton(
+            frame,
+            text="Часы спешат на",
+            value="ahead",
+            variable=self.clock_mode_var,
+            command=self._update_clock_entry_state,
+        )
+        self.clock_ahead_radio.pack(side="left", padx=(12, 0))
+
+        self.clock_entry = ttk.Entry(frame, textvariable=self.clock_minutes_var, width=8)
+        self.clock_entry.pack(side="left", padx=(4, 4))
+        ttk.Label(frame, text="мин").pack(side="left")
+
+        self.save_clock_button = ttk.Button(
+            frame, text="Сохранить в settings.ini", command=self.on_save_clock
+        )
+        self.save_clock_button.pack(side="right")
+
+    def _load_clock_from_config(self) -> None:
+        """Показать в полях значение ``clock_drift_minutes`` из settings.ini."""
+        value = float(getattr(self.config_data.finder, "clock_drift_minutes", 0.0) or 0.0)
+        if abs(value) < 1e-9:
+            mode, minutes = "none", 0.0
+        elif value > 0:
+            mode, minutes = "behind", value
+        else:
+            mode, minutes = "ahead", -value
+        self.clock_mode_var.set(mode)
+        self.clock_minutes_var.set(format_minutes(minutes))
+        self._update_clock_entry_state()
+        self._update_clock_labels()
+
+    def _update_clock_entry_state(self) -> None:
+        """Поле минут активно только для режимов «отстают»/«спешат»."""
+        state = "normal" if self.clock_mode_var.get() in ("behind", "ahead") else "disabled"
+        try:
+            self.clock_entry.configure(state=state)
+        except (tk.TclError, AttributeError):  # окно уже закрывается/не создано
+            pass
+
+    def _clock_value_from_fields(self) -> float:
+        """Значение сдвига (минут) из полей формы.
+
+        :raises ValueError: если число минут введено неверно
+        """
+        mode = self.clock_mode_var.get()
+        if mode == "none":
+            return 0.0
+        text = self.clock_minutes_var.get().strip().replace(",", ".")
+        if not text:
+            raise ValueError("Укажите количество минут сдвига.")
+        try:
+            minutes = abs(float(text))
+        except ValueError as exc:
+            raise ValueError(
+                "Количество минут должно быть числом, например 5 или 7.5."
+            ) from exc
+        return minutes if mode == "behind" else -minutes
+
+    def _update_clock_labels(self) -> None:
+        """Обновить read-only строки «Сдвиг часов: …» на вкладках «Задания» и «Ручное»."""
+        value = float(getattr(self.config_data.finder, "clock_drift_minutes", 0.0) or 0.0)
+        self.clock_label_var.set(f"Сдвиг часов: {clock_drift_text(value)}")
+        manual = getattr(self, "manual_tab", None)
+        if manual is not None:
+            manual.refresh_clock_label()
+
+    def on_edit_clock(self) -> None:
+        """Перейти на вкладку «Настройки» и поставить курсор в поле сдвига."""
+        self.notebook.select(self.settings_tab)
+        self.root.after(50, self._focus_clock_field)
+
+    def _focus_clock_field(self) -> None:
+        """Сфокусировать поле минут (или переключатель, если поле недоступно)."""
+        try:
+            if str(self.clock_entry.cget("state")) == "disabled":
+                self.clock_behind_radio.focus_set()
+            else:
+                self.clock_entry.focus_set()
+                self.clock_entry.select_range(0, "end")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def on_save_clock(self) -> None:
+        """Сохранить текущий сдвиг в settings.ini и обновить read-only строки."""
+        try:
+            new_value = self._clock_value_from_fields()
+        except ValueError as exc:
+            messagebox.showerror("Сдвиг часов", str(exc), parent=self)
+            return
+
+        try:
+            self._write_clock_to_ini(new_value)
+        except OSError as exc:
+            LOGGER.error("clock_drift: не удалось записать settings.ini: %s", exc)
+            messagebox.showerror(
+                "Сдвиг часов", f"Не удалось записать settings.ini: {exc}", parent=self
+            )
+            return
+
+        self.config_data.finder.clock_drift_minutes = new_value
+        LOGGER.info("clock_drift: сохранён сдвиг %s мин", format_minutes(new_value))
+        self._update_clock_labels()
+        self._rebuild_settings()
+        self.status_var.set(f"Сдвиг часов сохранён: {format_minutes(new_value)} мин")
+        messagebox.showinfo(
+            "Сдвиг часов", f"Сохранено: {format_minutes(new_value)} мин", parent=self
+        )
+
+    def _write_clock_to_ini(self, value: float) -> None:
+        """Записать ``clock_drift_minutes`` в settings.ini.
+
+        Ini правится построчно, чтобы сохранить комментарии и порядок
+        параметров (configparser при записи их теряет). Результат проверяется
+        через configparser: файл не должен стать нечитаемым.
+
+        :raises OSError: если файл не удалось прочитать или записать
+        """
+        path = Path(self.config_data.settings_path)
+        text = self._read_text_preserve(path)
+
+        newline = "\r\n" if "\r\n" in text else "\n"
+        lines = text.splitlines()
+        section = ""
+        finder_header: Optional[int] = None
+        key_index: Optional[int] = None
+        insert_index: Optional[int] = None
+
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            header = re.match(r"^\[(.+)\]$", stripped)
+            if header:
+                section = header.group(1).strip()
+                if section == "finder" and finder_header is None:
+                    finder_header = index
+                    insert_index = index + 1
+                continue
+            if section == "finder":
+                insert_index = index + 1
+                if re.match(r"^\s*clock_drift_minutes\s*=", line):
+                    key_index = index
+
+        if finder_header is None:
+            raise OSError("в settings.ini нет секции [finder]")
+
+        new_line = f"clock_drift_minutes={format_minutes(value)}"
+        if key_index is not None:
+            lines[key_index] = new_line
+        else:
+            position = insert_index if insert_index is not None else finder_header + 1
+            lines.insert(position, new_line)
+
+        new_text = newline.join(lines)
+        if text.endswith(("\n", "\r")):
+            new_text += newline
+
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read_string(new_text)
+        except configparser.Error as exc:
+            raise OSError(f"после правки файл стал некорректным: {exc}") from exc
+        if not parser.has_option("finder", "clock_drift_minutes"):
+            raise OSError("не удалось записать clock_drift_minutes в [finder]")
+
+        with path.open("w", encoding="utf-8", newline="") as stream:
+            stream.write(new_text)
+
+    @staticmethod
+    def _read_text_preserve(path: Path) -> str:
+        """Прочитать ini, сохранив переводы строк (UTF-8 BOM или cp1251)."""
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as stream:
+                return stream.read()
+        except UnicodeDecodeError:
+            with path.open("r", encoding="cp1251", newline="") as stream:
+                return stream.read()
+
+    # ------------------------------------------------------------------ #
+    # О программе
+    # ------------------------------------------------------------------ #
+    def on_about(self) -> None:
+        """Открыть модальное окно «О программе»."""
+        try:
+            show_about_dialog(self.root, APP_VERSION, BUILD_DATE)
+        except tk.TclError as exc:  # окно не должно ломать главное окно
+            LOGGER.error("Не удалось открыть окно «О программе»: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Обработчики кнопок
@@ -794,6 +1109,7 @@ class ExporterApp(ttk.Frame):
         self.azs = azs
         self._update_azs_label()
         self._rebuild_settings()
+        self._load_clock_from_config()
         self.manual_tab.on_config_changed()
         self.status_var.set("Настройки перечитаны")
         LOGGER.info("Настройки перечитаны из ini.")

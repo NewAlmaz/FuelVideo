@@ -16,12 +16,10 @@
 
 from __future__ import annotations
 
-import configparser
 import csv
 import logging
 import os
 import queue
-import re
 import threading
 import tkinter as tk
 from dataclasses import replace
@@ -113,6 +111,23 @@ def format_minutes(value: float) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
+def clock_drift_text(value: float) -> str:
+    """Read-only описание сдвига часов: ``5 мин (часы отстают)``.
+
+    Положительный ``clock_drift_minutes`` означает, что часы видео-сервера
+    отстают (к ``mtime`` прибавляется сдвиг), отрицательный — спешат.
+
+    :param value: значение ``clock_drift_minutes`` из settings.ini
+    :return: текст для строки «Сдвиг часов: …»
+    """
+    drift = float(value or 0.0)
+    if abs(drift) < 1e-9:
+        return "0 мин (без сдвига)"
+    if drift > 0:
+        return f"{format_minutes(drift)} мин (часы отстают)"
+    return f"{format_minutes(-drift)} мин (часы спешат)"
+
+
 class ManualTab(ttk.Frame):
     """Вкладка «Ручное копирование»: редактор строк и их выполнение."""
 
@@ -124,17 +139,16 @@ class ManualTab(ttk.Frame):
         self._stop_event = threading.Event()
         self._event_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
         self._busy = False
-        self._drift_not_saved = False
 
         self.start_var = tk.StringVar()
         self.end_var = tk.StringVar()
         self.trk_var = tk.StringVar()
-        self.clock_mode_var = tk.StringVar(value="none")
-        self.clock_minutes_var = tk.StringVar(value="0")
+        # Read-only строка «Сдвиг часов: …»; сам редактор живёт на вкладке «Настройки».
+        self.clock_value_var = tk.StringVar(value="Сдвиг часов: —")
         self.status_var = tk.StringVar(value="Готов к работе")
 
         self._build_ui()
-        self._load_clock_from_config()
+        self.refresh_clock_label()
         self.refresh_expiry_state()
         self.after(150, self._poll_events)
 
@@ -155,11 +169,10 @@ class ManualTab(ttk.Frame):
     # Построение интерфейса
     # ------------------------------------------------------------------ #
     def _build_ui(self) -> None:
-        """Создать форму, таблицы, панели запуска и блок сдвига часов."""
+        """Создать форму, таблицы, панели запуска и строку сдвига часов."""
         self._build_form()
         self._build_rows_tree()
         self._build_run_panel()
-        self._build_clock_panel()
         self._build_progress()
         self._build_results_tree()
 
@@ -250,41 +263,9 @@ class ManualTab(ttk.Frame):
         )
         self.open_button.pack(side="left")
 
-    def _build_clock_panel(self) -> None:
-        """Блок «Сдвиг часов видео-сервера»."""
-        frame = ttk.LabelFrame(self, text="Сдвиг часов видео-сервера", padding=6)
-        frame.pack(fill="x", pady=(6, 0))
-
-        ttk.Radiobutton(
-            frame,
-            text="Без сдвига",
-            value="none",
-            variable=self.clock_mode_var,
-            command=self._update_clock_entry_state,
-        ).pack(side="left")
-        ttk.Radiobutton(
-            frame,
-            text="Часы отстают на",
-            value="behind",
-            variable=self.clock_mode_var,
-            command=self._update_clock_entry_state,
-        ).pack(side="left", padx=(12, 0))
-        ttk.Radiobutton(
-            frame,
-            text="Часы спешат на",
-            value="ahead",
-            variable=self.clock_mode_var,
-            command=self._update_clock_entry_state,
-        ).pack(side="left", padx=(12, 0))
-
-        self.clock_entry = ttk.Entry(frame, textvariable=self.clock_minutes_var, width=8)
-        self.clock_entry.pack(side="left", padx=(4, 4))
-        ttk.Label(frame, text="мин").pack(side="left")
-
-        self.save_clock_button = ttk.Button(
-            frame, text="Сохранить в settings.ini", command=self.on_save_clock
-        )
-        self.save_clock_button.pack(side="right")
+        # Сдвиг часов задаётся на вкладке «Настройки»; здесь только показ и переход.
+        ttk.Button(frame, text="Изменить", command=self.on_edit_clock).pack(side="right")
+        ttk.Label(frame, textvariable=self.clock_value_var).pack(side="right", padx=(12, 6))
 
     def _build_progress(self) -> None:
         """Прогресс-бар и строка статуса."""
@@ -318,140 +299,21 @@ class ManualTab(ttk.Frame):
         frame.columnconfigure(0, weight=1)
 
     # ------------------------------------------------------------------ #
-    # Сдвиг часов: чтение, запись, сохранение в settings.ini
+    # Сдвиг часов видео-сервера (редактор — на вкладке «Настройки»)
     # ------------------------------------------------------------------ #
-    def _load_clock_from_config(self) -> None:
-        """Показать в полях значение ``clock_drift_minutes`` из settings.ini."""
+    def refresh_clock_label(self) -> None:
+        """Обновить read-only строку «Сдвиг часов: …» из settings.ini."""
         value = float(getattr(self.config.finder, "clock_drift_minutes", 0.0) or 0.0)
-        if abs(value) < 1e-9:
-            mode, minutes = "none", 0.0
-        elif value > 0:
-            mode, minutes = "behind", value
-        else:
-            mode, minutes = "ahead", -value
-        self.clock_mode_var.set(mode)
-        self.clock_minutes_var.set(format_minutes(minutes))
-        self._update_clock_entry_state()
-
-    def _update_clock_entry_state(self) -> None:
-        """Поле минут активно только для режимов «отстают»/«спешат»."""
-        state = "normal" if self.clock_mode_var.get() in ("behind", "ahead") else "disabled"
         try:
-            self.clock_entry.configure(state=state)
+            self.clock_value_var.set(f"Сдвиг часов: {clock_drift_text(value)}")
         except tk.TclError:  # окно уже закрывается
             pass
 
-    def _clock_value_from_fields(self) -> float:
-        """Значение сдвига (минут) из полей формы.
-
-        :raises ValueError: если число минут введено неверно
-        """
-        mode = self.clock_mode_var.get()
-        if mode == "none":
-            return 0.0
-        text = self.clock_minutes_var.get().strip().replace(",", ".")
-        if not text:
-            raise ValueError("Укажите количество минут сдвига.")
-        try:
-            minutes = abs(float(text))
-        except ValueError as exc:
-            raise ValueError(
-                "Количество минут должно быть числом, например 5 или 7.5."
-            ) from exc
-        return minutes if mode == "behind" else -minutes
-
-    def on_save_clock(self) -> None:
-        """Сохранить текущий сдвиг в settings.ini."""
-        try:
-            new_value = self._clock_value_from_fields()
-        except ValueError as exc:
-            messagebox.showerror("Сдвиг часов", str(exc), parent=self)
-            return
-
-        try:
-            self._write_clock_to_ini(new_value)
-        except OSError as exc:
-            LOGGER.error("clock_drift: не удалось записать settings.ini: %s", exc)
-            messagebox.showerror(
-                "Сдвиг часов", f"Не удалось записать settings.ini: {exc}", parent=self
-            )
-            return
-
-        self.config.finder.clock_drift_minutes = new_value
-        self._drift_not_saved = False
-        LOGGER.info("clock_drift: сохранён сдвиг %s мин", format_minutes(new_value))
-        messagebox.showinfo(
-            "Сдвиг часов", f"Сохранено: {format_minutes(new_value)} мин", parent=self
-        )
-        self.status_var.set(f"Сдвиг часов сохранён: {format_minutes(new_value)} мин")
-
-    def _write_clock_to_ini(self, value: float) -> None:
-        """Записать ``clock_drift_minutes`` в settings.ini.
-
-        Ini правится построчно, чтобы сохранить комментарии и порядок
-        параметров (configparser при записи их теряет). Результат проверяется
-        через configparser: файл не должен стать нечитаемым.
-
-        :raises OSError: если файл не удалось прочитать или записать
-        """
-        path = Path(self.config.settings_path)
-        text = self._read_text_preserve(path)
-
-        newline = "\r\n" if "\r\n" in text else "\n"
-        lines = text.splitlines()
-        section = ""
-        finder_header: Optional[int] = None
-        key_index: Optional[int] = None
-        insert_index: Optional[int] = None
-
-        for index, line in enumerate(lines):
-            stripped = line.strip()
-            header = re.match(r"^\[(.+)\]$", stripped)
-            if header:
-                section = header.group(1).strip()
-                if section == "finder" and finder_header is None:
-                    finder_header = index
-                    insert_index = index + 1
-                continue
-            if section == "finder":
-                insert_index = index + 1
-                if re.match(r"^\s*clock_drift_minutes\s*=", line):
-                    key_index = index
-
-        if finder_header is None:
-            raise OSError("в settings.ini нет секции [finder]")
-
-        new_line = f"clock_drift_minutes={format_minutes(value)}"
-        if key_index is not None:
-            lines[key_index] = new_line
-        else:
-            position = insert_index if insert_index is not None else finder_header + 1
-            lines.insert(position, new_line)
-
-        new_text = newline.join(lines)
-        if text.endswith(("\n", "\r")):
-            new_text += newline
-
-        parser = configparser.ConfigParser(interpolation=None)
-        try:
-            parser.read_string(new_text)
-        except configparser.Error as exc:
-            raise OSError(f"после правки файл стал некорректным: {exc}") from exc
-        if not parser.has_option("finder", "clock_drift_minutes"):
-            raise OSError("не удалось записать clock_drift_minutes в [finder]")
-
-        with path.open("w", encoding="utf-8", newline="") as stream:
-            stream.write(new_text)
-
-    @staticmethod
-    def _read_text_preserve(path: Path) -> str:
-        """Прочитать ini, сохранив переводы строк (UTF-8 BOM или cp1251)."""
-        try:
-            with path.open("r", encoding="utf-8-sig", newline="") as stream:
-                return stream.read()
-        except UnicodeDecodeError:
-            with path.open("r", encoding="cp1251", newline="") as stream:
-                return stream.read()
+    def on_edit_clock(self) -> None:
+        """Перейти к редактированию сдвига часов на вкладке «Настройки»."""
+        handler = getattr(self.app, "on_edit_clock", None)
+        if callable(handler):
+            handler()  # type: ignore[misc]
 
     # ------------------------------------------------------------------ #
     # Добавление и удаление строк
@@ -832,7 +694,7 @@ class ManualTab(ttk.Frame):
 
     def on_config_changed(self) -> None:
         """Перечитать сдвиг часов и сбросить результаты (смена АЗС, ini)."""
-        self._load_clock_from_config()
+        self.refresh_clock_label()
         self._clear_results()
         for row in self.manual_rows:
             if row.error:
@@ -861,17 +723,10 @@ class ManualTab(ttk.Frame):
             )
             return
 
-        try:
-            drift = self._clock_value_from_fields()
-        except ValueError as exc:
-            messagebox.showerror("Сдвиг часов", str(exc), parent=self)
-            return
-
         config = self.config
         azs = self.azs
-        ini_drift = float(getattr(config.finder, "clock_drift_minutes", 0.0) or 0.0)
-        self._drift_not_saved = abs(drift - ini_drift) > 1e-9
-        # Сдвиг из полей применяется ТОЛЬКО к текущему поиску.
+        # Сдвиг часов берётся из settings.ini (редактируется на вкладке «Настройки»).
+        drift = float(getattr(config.finder, "clock_drift_minutes", 0.0) or 0.0)
         finder_cfg = replace(config.finder, clock_drift_minutes=drift)
 
         rows = list(self.manual_rows)
@@ -896,13 +751,12 @@ class ManualTab(ttk.Frame):
         mode_text = "Поиск" if scan_only else "Копирование"
         self.status_var.set(f"{mode_text}: 0 из {total_cells}")
         LOGGER.info(
-            "Ручное копирование (%s): АЗС %s, строк %s, output_root=%s, сдвиг %s мин%s",
+            "Ручное копирование (%s): АЗС %s, строк %s, output_root=%s, сдвиг %s мин",
             mode_text,
             azs.number,
             len(rows),
             azs.output_root,
             format_minutes(drift),
-            " (не сохранён в settings.ini)" if self._drift_not_saved else "",
         )
         self._set_busy(True)
 
@@ -1182,8 +1036,6 @@ class ManualTab(ttk.Frame):
             )
         if stopped:
             text = "Остановлено пользователем. " + text
-        if self._drift_not_saved:
-            text += " (сдвиг не сохранён в settings.ini)"
         if report is not None:
             text += f". Отчёт: {report}"
         self.status_var.set(text)
