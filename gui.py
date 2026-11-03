@@ -52,7 +52,7 @@ from xlsx_reader import RowData, XlsxError, read_rows
 LOGGER = logging.getLogger(__name__)
 
 #: Версия приложения (заголовок окна и «О программе»).
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 #: Сведения для окна «О программе» (кроме версии и даты сборки).
 ABOUT_TITLE = "FuelVideo"
