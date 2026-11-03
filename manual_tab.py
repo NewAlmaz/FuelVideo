@@ -49,6 +49,12 @@ from manual_xlsx import (
     read_manual_xlsx,
     write_manual_xlsx,
 )
+from ui_helpers import (
+    attach_placeholder,
+    get_value,
+    on_datetime_key,
+    refresh_placeholder,
+)
 from video_finder import FoundFile
 from xlsx_reader import XlsxError
 
@@ -56,6 +62,12 @@ LOGGER = logging.getLogger(__name__)
 
 DATETIME_HINT = (
     "Неверный формат. Ожидается YYYY-MM-DD HH:MM, например 2026-09-17 13:28"
+)
+DATETIME_PLACEHOLDER = "YYYY-MM-DD HH:MM"
+DATETIME_HELP = (
+    "Формат: YYYY-MM-DD HH:MM (например 2026-09-17 13:28). "
+    "Можно вводить только цифры: 202609171328 автоматически превратится "
+    "в 2026-09-17 13:28. ТРК — через запятую (1,2); пусто = все ТРК из azs.ini."
 )
 
 #: Служебный статус «найдено, но не скопировано» (только для этой вкладки).
@@ -182,13 +194,11 @@ class ManualTab(ttk.Frame):
         form.pack(fill="x")
 
         ttk.Label(form, text="Начало").grid(row=0, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.start_var, width=18).grid(
-            row=0, column=1, sticky="w", padx=(4, 12)
-        )
+        self.start_entry = ttk.Entry(form, textvariable=self.start_var, width=18)
+        self.start_entry.grid(row=0, column=1, sticky="w", padx=(4, 12))
         ttk.Label(form, text="Конец").grid(row=0, column=2, sticky="w")
-        ttk.Entry(form, textvariable=self.end_var, width=18).grid(
-            row=0, column=3, sticky="w", padx=(4, 12)
-        )
+        self.end_entry = ttk.Entry(form, textvariable=self.end_var, width=18)
+        self.end_entry.grid(row=0, column=3, sticky="w", padx=(4, 12))
         ttk.Label(form, text="ТРК").grid(row=0, column=4, sticky="w")
         ttk.Entry(form, textvariable=self.trk_var, width=14).grid(
             row=0, column=5, sticky="w", padx=(4, 12)
@@ -197,12 +207,22 @@ class ManualTab(ttk.Frame):
         self.add_button.grid(row=0, column=6, sticky="w", padx=(12, 0))
         form.columnconfigure(6, weight=1)
 
+        # Поля даты-времени: placeholder-образец и пост-обработка «сырых» цифр.
+        for entry, var in (
+            (self.start_entry, self.start_var),
+            (self.end_entry, self.end_var),
+        ):
+            attach_placeholder(entry, DATETIME_PLACEHOLDER, var)
+            entry.bind(
+                "<KeyRelease>",
+                lambda event, field=entry, value_var=var: on_datetime_key(
+                    event, field, value_var
+                ),
+            )
+
         ttk.Label(
             form,
-            text=(
-                f"Формат: {DATETIME_FORMAT}, например 2026-09-17 13:28. "
-                "ТРК — через запятую (1,2); пусто = все ТРК из azs.ini."
-            ),
+            text=DATETIME_HELP,
         ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
 
     def _build_rows_tree(self) -> None:
@@ -359,8 +379,10 @@ class ManualTab(ttk.Frame):
 
     def on_add_row(self) -> None:
         """Проверить поля формы и добавить строку в таблицу."""
-        start_text = self.start_var.get().strip()
-        end_text = self.end_var.get().strip()
+        # get_value возвращает "" при активном placeholder, поэтому подсказка
+        # не попадает в парсинг даты-времени.
+        start_text = get_value(self.start_entry).strip()
+        end_text = get_value(self.end_entry).strip()
         if not start_text or not end_text:
             messagebox.showerror(
                 "Ручное копирование",
@@ -422,6 +444,8 @@ class ManualTab(ttk.Frame):
         self._refresh_rows_tree()
         self.start_var.set("")
         self.end_var.set("")
+        refresh_placeholder(self.start_entry)
+        refresh_placeholder(self.end_entry)
         self.status_var.set(f"Строк в списке: {len(self.manual_rows)}")
         LOGGER.info(
             "Ручное копирование: добавлена строка АЗС %s %s..%s, ТРК %s",

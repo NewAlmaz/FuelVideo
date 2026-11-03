@@ -883,7 +883,10 @@ class ExporterApp(ttk.Frame):
     # ------------------------------------------------------------------ #
     def on_choose_xlsx(self) -> None:
         """Выбрать файл xlsx и загрузить строки."""
-        initial_dir = str(self.xlsx_path.parent) if self.xlsx_path else str(Path.home())
+        if self.xlsx_path is not None:
+            initial_dir = str(self.xlsx_path.parent)
+        else:
+            initial_dir = str(self.config_data.base_dir)
         path_text = filedialog.askopenfilename(
             title="Выберите файл xlsx со списком заправок",
             initialdir=initial_dir,
